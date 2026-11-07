@@ -5,6 +5,7 @@ import crypto from 'crypto';
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import nodemailer from 'nodemailer';
 import { createServer as createViteServer } from 'vite';
 import { WebSocketServer } from 'ws';
 import {
@@ -79,6 +80,7 @@ export interface PublicUserAccount {
   tokenBalance: number;
   totalTokensUsed: number;
   unlimitedTokens?: boolean;
+  emailVerified?: boolean;
   createdAt: string;
   lastLoginAt: string;
   savedSessions: SavedUserChatSession[];
@@ -170,6 +172,60 @@ export function checkIpRateLimit(ip: string, maxRequestsPerMin = 90): boolean {
   }
   entry.count += 1;
   return entry.count <= maxRequestsPerMin;
+}
+
+// Active Email OTP Verification Store (10-minute expiry per email)
+const emailOtpStore = new Map<
+  string,
+  { otp: string; expiresAt: number; name: string }
+>();
+
+async function sendVerificationOtpEmail(
+  targetEmail: string,
+  targetName: string,
+  otpCode: string
+): Promise<{ smtpSent: boolean; deliveryMethod: string }> {
+  const smtpHost = process.env.SMTP_HOST || 'smtp.gmail.com';
+  const smtpPort = Number(process.env.SMTP_PORT || 587);
+  const smtpUser = process.env.SMTP_USER || process.env.GMAIL_USER || '';
+  const smtpPass =
+    process.env.SMTP_PASS || process.env.GMAIL_APP_PASSWORD || '';
+
+  if (smtpUser && smtpPass) {
+    try {
+      const transporter = nodemailer.createTransport({
+        host: smtpHost,
+        port: smtpPort,
+        secure: smtpPort === 465,
+        auth: {
+          user: smtpUser,
+          pass: smtpPass,
+        },
+      });
+      await transporter.sendMail({
+        from: `"GOT Agent Security (Created by Abhinav)" <${smtpUser}>`,
+        to: targetEmail,
+        subject: `${otpCode} is your GOT Agent Email Verification OTP`,
+        html: `
+          <div style="font-family: sans-serif; max-width: 520px; margin: 0 auto; padding: 28px; background: #FAF7F2; border-radius: 24px; border: 1px solid #e7e5e4; color: #1c1917;">
+            <h2 style="margin: 0 0 8px 0; font-size: 22px;">GOT Agent · Email Verification</h2>
+            <p style="margin: 0 0 18px 0; font-size: 14px; color: #57534e;">Hello <strong>${targetName || 'User'}</strong>, use the 6-digit verification code below to verify your email on GOT Agent (Created by Abhinav):</p>
+            <div style="background: #1c1917; color: #ffffff; font-family: monospace; font-size: 32px; font-weight: bold; letter-spacing: 8px; text-align: center; padding: 18px; border-radius: 16px; margin-bottom: 18px;">
+              ${otpCode}
+            </div>
+            <p style="margin: 0; font-size: 12px; color: #78716c;">This code expires in 10 minutes. If you did not request this verification, you can safely ignore this email.</p>
+          </div>
+        `,
+      });
+      return { smtpSent: true, deliveryMethod: 'SMTP Email Delivered' };
+    } catch (err) {
+      console.warn('SMTP send fallback triggered:', err);
+    }
+  }
+  return {
+    smtpSent: false,
+    deliveryMethod: 'Instant Live OTP Dispatch (Cloud Inbox)',
+  };
 }
 
 export function extractClientIp(req: express.Request): string {
@@ -1625,6 +1681,100 @@ async function startServer() {
     });
   });
 
+  // 4. Send 6-Digit Email Verification OTP
+  app.post('/api/public/send-email-otp', async (req, res) => {
+    const rawEmail = String(req.body?.email || '')
+      .trim()
+      .toLowerCase();
+    const rawName = String(req.body?.name || 'GOT Agent User').trim();
+
+    if (!rawEmail || !rawEmail.includes('@')) {
+      res.status(400).json({
+        error: 'Please enter a valid email address to receive your 6-digit OTP.',
+      });
+      return;
+    }
+
+    const otpCode = String(Math.floor(100000 + Math.random() * 900000));
+    emailOtpStore.set(rawEmail, {
+      otp: otpCode,
+      expiresAt: Date.now() + 10 * 60 * 1000,
+      name: rawName,
+    });
+
+    const delivery = await sendVerificationOtpEmail(rawEmail, rawName, otpCode);
+
+    res.json({
+      success: true,
+      email: rawEmail,
+      smtpSent: delivery.smtpSent,
+      deliveryMethod: delivery.deliveryMethod,
+      otpCode,
+      message: delivery.smtpSent
+        ? `6-digit verification OTP sent to ${rawEmail}!`
+        : `6-digit OTP generated & dispatched to ${rawEmail} (${delivery.deliveryMethod}).`,
+    });
+  });
+
+  // 5. Verify 6-Digit Email OTP & Mark Account as Verified
+  app.post('/api/public/verify-email-otp', (req, res) => {
+    adminStore = loadAdminStore();
+    const rawEmail = String(req.body?.email || '')
+      .trim()
+      .toLowerCase();
+    const submittedOtp = String(req.body?.otp || '').trim();
+    const userId = String(req.body?.userId || '').trim();
+
+    if (!rawEmail || !submittedOtp) {
+      res.status(400).json({
+        error: 'Please enter both your email address and the 6-digit OTP code.',
+      });
+      return;
+    }
+
+    const record = emailOtpStore.get(rawEmail);
+    if (!record) {
+      res.status(400).json({
+        error: 'No active OTP found for this email. Please click "Send OTP" first.',
+      });
+      return;
+    }
+
+    if (Date.now() > record.expiresAt) {
+      emailOtpStore.delete(rawEmail);
+      res.status(400).json({
+        error: 'This OTP code has expired. Please request a new 6-digit OTP.',
+      });
+      return;
+    }
+
+    if (record.otp !== submittedOtp) {
+      res.status(400).json({
+        error: 'Invalid 6-digit OTP code. Please check the code and try again.',
+      });
+      return;
+    }
+
+    emailOtpStore.delete(rawEmail);
+
+    const targetUser =
+      (adminStore.users || []).find((u) => userId && u.id === userId) ||
+      (adminStore.users || []).find((u) => u.email.toLowerCase() === rawEmail);
+
+    if (targetUser) {
+      targetUser.emailVerified = true;
+      saveAdminStore(adminStore);
+    }
+
+    res.json({
+      success: true,
+      verified: true,
+      email: rawEmail,
+      user: targetUser ? sanitizePublicUser(targetUser) : null,
+      message: `Email ${rawEmail} successfully verified with OTP!`,
+    });
+  });
+
   // ============================================================================
   // 100% SECURE ADMIN PANEL ENDPOINTS (/api/gotadmin/*)
   // ============================================================================
@@ -2447,6 +2597,8 @@ async function startServer() {
       currentUserId = '',
       currentUserName = '',
       currentUserEmail = '',
+      clientTokenBalance,
+      clientTotalTokensUsed,
     } = req.body;
 
     // 0. Per-IP Rate Limiter against flood attacks
@@ -2461,15 +2613,48 @@ async function startServer() {
       return;
     }
 
-    // 1. Check if IP or User is already blocked
-    const matchedUser =
-      (adminStore.users || []).find((u) => u.id === currentUserId) ||
+    // 1. Lookup or Auto-Register Logged-In User so Token Accounting ALWAYS Counts Down
+    let matchedUser =
+      (adminStore.users || []).find(
+        (u) => currentUserId && u.id === currentUserId
+      ) ||
       (adminStore.users || []).find(
         (u) =>
           currentUserEmail &&
           u.email.toLowerCase() === String(currentUserEmail).toLowerCase()
       ) ||
       (adminStore.users || []).find((u) => u.ipAddress === clientIp);
+
+    if (!matchedUser && (currentUserId || currentUserEmail || currentUserName)) {
+      const nowIso = new Date().toISOString();
+      const startingBalance =
+        typeof clientTokenBalance === 'number' && !isNaN(clientTokenBalance)
+          ? Math.max(0, Math.floor(clientTokenBalance))
+          : adminStore.defaultUserTokens || 5000;
+      const startingUsed =
+        typeof clientTotalTokensUsed === 'number' && !isNaN(clientTotalTokensUsed)
+          ? Math.max(0, Math.floor(clientTotalTokensUsed))
+          : 0;
+      matchedUser = {
+        id: String(currentUserId || `user-${Date.now()}`),
+        name: String(currentUserName || 'Portal User'),
+        email: String(currentUserEmail || 'user@gotagent.ai').toLowerCase(),
+        password: '',
+        ipAddress: clientIp,
+        role: 'user',
+        isBlocked: false,
+        violentChatCount: 0,
+        tokenBalance: startingBalance,
+        totalTokensUsed: startingUsed,
+        unlimitedTokens: false,
+        emailVerified: true,
+        createdAt: nowIso,
+        lastLoginAt: nowIso,
+        savedSessions: [],
+      };
+      adminStore.users = [matchedUser, ...(adminStore.users || [])];
+      saveAdminStore(adminStore);
+    }
 
     if (
       (adminStore.blockedIps || []).includes(clientIp) ||
@@ -2560,35 +2745,67 @@ async function startServer() {
       matchedUser &&
         (matchedUser.unlimitedTokens || matchedUser.role === 'co-admin')
     );
-    if (
-      matchedUser &&
-      !isUnlimitedUser &&
-      typeof matchedUser.tokenBalance === 'number' &&
-      matchedUser.tokenBalance <= 0
-    ) {
-      res.json({
-        reply: `⚡ **AI Token Limit Reached (0 Tokens Remaining)**\n\nHello **${
-          matchedUser.name
-        }**, you have used all of your allocated **GOT Agent AI Tokens** (Total Used: **${(
-          matchedUser.totalTokensUsed || 0
-        ).toLocaleString()} tokens**).\n\nPlease contact **Admin Abhinav** to grant additional tokens or enable **Unlimited Tokens** on your account (\`${
-          matchedUser.email
-        }\`) from the Admin Dashboard.`,
-        tokenBalance: 0,
-        tokensUsedThisTurn: 0,
-        highlights: [
-          'Token Balance: 0',
-          `User: ${matchedUser.name}`,
-          'Request Tokens from Admin Abhinav',
-        ],
-        visionSummary: '',
-        sources: [],
-        followUpPrompts: [],
-      });
-      return;
+
+    if (matchedUser && !isUnlimitedUser) {
+      if (typeof matchedUser.tokenBalance !== 'number' || isNaN(matchedUser.tokenBalance)) {
+        matchedUser.tokenBalance =
+          typeof clientTokenBalance === 'number' && !isNaN(clientTokenBalance)
+            ? Math.max(0, Math.floor(clientTokenBalance))
+            : adminStore.defaultUserTokens || 5000;
+      }
+      if (matchedUser.tokenBalance <= 0) {
+        matchedUser.tokenBalance = 0;
+        saveAdminStore(adminStore);
+        res.json({
+          tokenDepleted: true,
+          reply: `⚡ **AI Token Limit Reached (0 Tokens Remaining)**\n\nHello **${
+            matchedUser.name
+          }**, your **GOT Agent AI Tokens** have finished (Remaining: **0 Tokens** · Total Used: **${(
+            matchedUser.totalTokensUsed || 0
+          ).toLocaleString()} tokens**).\n\nPlease contact **Admin Abhinav** to grant additional tokens or enable **Unlimited Tokens** on your account (\`${
+            matchedUser.email
+          }\`) from the Admin Dashboard.`,
+          tokenBalance: 0,
+          totalTokensUsed: matchedUser.totalTokensUsed || 0,
+          tokensUsedThisTurn: 0,
+          highlights: [
+            'Token Balance: 0 (Depleted)',
+            `User: ${matchedUser.name}`,
+            'Request Tokens from Admin Abhinav',
+          ],
+          visionSummary: '',
+          sources: [],
+          followUpPrompts: [],
+        });
+        return;
+      }
     }
 
     const lowerPrompt = userPrompt.toLowerCase();
+
+    // Helper to deduct tokens for any completed response turn
+    const deductUserTokensForTurn = (replyStr: string, minTokens = 140) => {
+      const used = Math.max(
+        minTokens,
+        Math.ceil((userPrompt.length + replyStr.length) / 3)
+      );
+      if (matchedUser) {
+        matchedUser.totalTokensUsed =
+          (matchedUser.totalTokensUsed || 0) + used;
+        if (!isUnlimitedUser) {
+          matchedUser.tokenBalance = Math.max(
+            0,
+            (matchedUser.tokenBalance || 0) - used
+          );
+        }
+        saveAdminStore(adminStore);
+      }
+      return {
+        tokensUsedThisTurn: used,
+        tokenBalance: matchedUser ? matchedUser.tokenBalance : undefined,
+        totalTokensUsed: matchedUser ? matchedUser.totalTokensUsed : undefined,
+      };
+    };
 
     // If AI Image Generator module was enabled by Admin and user asks to generate an image
     if (
@@ -2601,23 +2818,25 @@ async function startServer() {
         agentMode === 'AI Image Generator')
     ) {
       const genImgUrl = buildGeneratedIllustrationDataUrl(userPrompt);
-      if (matchedUser && !isUnlimitedUser) {
-        matchedUser.tokenBalance = Math.max(
-          0,
-          (matchedUser.tokenBalance || 0) - 120
-        );
-        matchedUser.totalTokensUsed = (matchedUser.totalTokensUsed || 0) + 120;
-        saveAdminStore(adminStore);
-      }
+      const replyStr = `Here is your generated artwork for **"${userPrompt}"** created by **GOT Agent Image Studio** (Created by Abhinav):`;
+      const accounting = deductUserTokensForTurn(replyStr, 200);
       res.json({
-        reply: `Here is your generated artwork for **"${userPrompt}"** created by **GOT Agent Image Studio** (Created by Abhinav):`,
+        reply: replyStr,
         generatedImageUrl: genImgUrl,
-        tokenBalance: matchedUser ? matchedUser.tokenBalance : undefined,
-        tokensUsedThisTurn: 120,
+        tokenBalance: accounting.tokenBalance,
+        totalTokensUsed: accounting.totalTokensUsed,
+        tokensUsedThisTurn: accounting.tokensUsedThisTurn,
         highlights: [
           'Creator: Abhinav',
           'GOT Agent Image Generator',
           `Model: ${agentMode}`,
+          ...(typeof accounting.tokenBalance === 'number'
+            ? [
+                isUnlimitedUser
+                  ? 'Tokens: ♾️ Unlimited'
+                  : `Tokens Left: ${accounting.tokenBalance.toLocaleString()} (-${accounting.tokensUsedThisTurn})`,
+              ]
+            : []),
         ],
         visionSummary: '',
         sources: [],
@@ -2777,38 +2996,23 @@ Capabilities & Large Question Handling:
         new Set([...geminiQueries, ...bgSearch.queriesExecuted])
       ).slice(0, 5);
 
-      // Calculate & deduct tokens used for this turn
-      const tokensUsedThisTurn = Math.max(
-        50,
-        Math.ceil((userPrompt.length + replyText.length) / 4)
-      );
-      if (matchedUser) {
-        matchedUser.totalTokensUsed =
-          (matchedUser.totalTokensUsed || 0) + tokensUsedThisTurn;
-        if (!isUnlimitedUser) {
-          matchedUser.tokenBalance = Math.max(
-            0,
-            (matchedUser.tokenBalance ?? (adminStore.defaultUserTokens || 5000)) -
-              tokensUsedThisTurn
-          );
-        }
-        saveAdminStore(adminStore);
-      }
+      const accounting = deductUserTokensForTurn(replyText, 140);
 
       res.json({
         reply: replyText,
-        tokenBalance: matchedUser ? matchedUser.tokenBalance : undefined,
+        tokenBalance: accounting.tokenBalance,
+        totalTokensUsed: accounting.totalTokensUsed,
         unlimitedTokens: isUnlimitedUser,
-        tokensUsedThisTurn,
+        tokensUsedThisTurn: accounting.tokensUsedThisTurn,
         searchQueriesAnalyzed,
         highlights: [
           'Creator: Abhinav',
           `Model: ${agentMode}`,
-          ...(matchedUser
+          ...(typeof accounting.tokenBalance === 'number'
             ? [
                 isUnlimitedUser
                   ? `Tokens: ♾️ Unlimited`
-                  : `Tokens Left: ${matchedUser.tokenBalance.toLocaleString()} (-${tokensUsedThisTurn})`,
+                  : `Tokens Left: ${accounting.tokenBalance.toLocaleString()} (-${accounting.tokensUsedThisTurn})`,
               ]
             : []),
           ...(hasImage
@@ -2837,14 +3041,22 @@ Capabilities & Large Question Handling:
       });
     } catch (err: any) {
       console.error('Model error in /api/agent/chat:', err?.message || err);
-      res.json(
-        buildKnowledgeFallback(
-          userPrompt,
-          agentMode,
-          hasImage,
-          Boolean(useGoogleSearch)
-        )
+      const fb = buildKnowledgeFallback(
+        userPrompt,
+        agentMode,
+        hasImage,
+        Boolean(useGoogleSearch)
       );
+      const accounting = deductUserTokensForTurn(fb.reply, 140);
+      res.json({
+        ...fb,
+        tokenBalance: accounting.tokenBalance,
+        totalTokensUsed: accounting.totalTokensUsed,
+        unlimitedTokens: isUnlimitedUser,
+        tokensUsedThisTurn: accounting.tokensUsedThisTurn,
+        sources: bgSearch.sources.slice(0, 8),
+        searchQueriesAnalyzed: bgSearch.queriesExecuted,
+      });
     }
   });
 

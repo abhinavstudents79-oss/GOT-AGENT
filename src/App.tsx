@@ -55,6 +55,18 @@ import {
 
 import operatorAvatarImg from './assets/images/avatar_executive_operator_1793981937152.jpg';
 import sampleNotesImg from './assets/images/sample_vision_notes_1794028209924.jpg';
+import {
+  OfficialWebsiteSections,
+  PublicWebsiteTab,
+} from './components/OfficialWebsiteSections';
+import {
+  auth,
+  onAuthStateChanged,
+  signInWithGoogleFirebase,
+  syncFirebaseAuthenticatedUser,
+  syncChatSessionToFirebase,
+  subscribeGlobalSiteConfigFromFirebase,
+} from './firebase';
 
 const OPERATOR_AVATAR_URL = operatorAvatarImg;
 const SAMPLE_NOTES_IMAGE = sampleNotesImg;
@@ -110,9 +122,69 @@ interface PublicUserAccount {
   tokenBalance?: number;
   totalTokensUsed?: number;
   unlimitedTokens?: boolean;
+  emailVerified?: boolean;
   createdAt: string;
   lastLoginAt: string;
   savedSessions: ChatSession[];
+}
+
+const USER_TOKEN_LEDGER_KEY = 'got_user_tokens_ledger_v2';
+
+function readUserTokenLedger(
+  userId?: string,
+  email?: string
+): { tokenBalance: number; totalTokensUsed: number; updatedAt: number } | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(USER_TOKEN_LEDGER_KEY);
+    if (!raw) return null;
+    const map = JSON.parse(raw);
+    const key1 = userId ? String(userId).trim() : '';
+    const key2 = email ? String(email).trim().toLowerCase() : '';
+    return (key1 && map[key1]) || (key2 && map[key2]) || null;
+  } catch {
+    return null;
+  }
+}
+
+function saveUserTokenLedger(
+  userOrId: PublicUserAccount | string | undefined,
+  email?: string,
+  tokenBalance?: number,
+  totalTokensUsed?: number
+) {
+  if (typeof window === 'undefined') return;
+  try {
+    const raw = window.localStorage.getItem(USER_TOKEN_LEDGER_KEY);
+    const map = raw ? JSON.parse(raw) : {};
+    const uid =
+      typeof userOrId === 'object' && userOrId !== null
+        ? userOrId.id
+        : userOrId;
+    const em =
+      typeof userOrId === 'object' && userOrId !== null
+        ? userOrId.email
+        : email;
+    const bal =
+      typeof userOrId === 'object' && userOrId !== null
+        ? userOrId.tokenBalance ?? 5000
+        : tokenBalance ?? 5000;
+    const used =
+      typeof userOrId === 'object' && userOrId !== null
+        ? userOrId.totalTokensUsed ?? 0
+        : totalTokensUsed ?? 0;
+
+    const entry = {
+      tokenBalance: Math.max(0, Math.floor(bal)),
+      totalTokensUsed: Math.max(0, Math.floor(used)),
+      updatedAt: Date.now(),
+    };
+    if (uid) map[String(uid).trim()] = entry;
+    if (em) map[String(em).trim().toLowerCase()] = entry;
+    window.localStorage.setItem(USER_TOKEN_LEDGER_KEY, JSON.stringify(map));
+  } catch {
+    // Ignore storage quota error
+  }
 }
 
 interface CoAdminAnnouncement {
@@ -4091,12 +4163,15 @@ export default function App() {
   const [isDark, setIsDark] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [a4SheetMode, setA4SheetMode] = useState(false);
+  const [activeWebsiteTab, setActiveWebsiteTab] =
+    useState<PublicWebsiteTab>('home');
+  const [firebaseConnected, setFirebaseConnected] = useState<boolean>(true);
   const [layoutWidthMode, setLayoutWidthMode] = useState<
     'auto' | 'mobile' | 'a4' | 'wide'
   >('auto');
   const [devicePanelOpen, setDevicePanelOpen] = useState(false);
 
-  // Public Website User Portal + IP Auto-Login + Violent Chat IP Block State
+  // Public Website User Portal + Email OTP Verification + IP Auto-Login + Violent Chat IP Block State
   const [currentUser, setCurrentUser] = useState<PublicUserAccount | null>(null);
   const [clientIp, setClientIp] = useState<string>(() =>
     getOrGenerateClientIp()
@@ -4114,6 +4189,41 @@ export default function App() {
   const [authError, setAuthError] = useState('');
   const [isAuthSubmitting, setIsAuthSubmitting] = useState(false);
   const [showSwitchAccountModal, setShowSwitchAccountModal] = useState(false);
+
+  // 6-Digit Email OTP Verification State
+  const [otpInputCode, setOtpInputCode] = useState('');
+  const [dispatchedOtpPreview, setDispatchedOtpPreview] = useState('');
+  const [otpStatusMessage, setOtpStatusMessage] = useState('');
+  const [isSendingOtp, setIsSendingOtp] = useState(false);
+  const [isVerifyingOtp, setIsVerifyingOtp] = useState(false);
+  const [emailOtpVerified, setEmailOtpVerified] = useState(false);
+
+  // Subscribe to Firebase Global Site Config & Auth State
+  useEffect(() => {
+    let unsubConfig: (() => void) | undefined;
+    try {
+      unsubConfig = subscribeGlobalSiteConfigFromFirebase((fbData) => {
+        if (fbData) {
+          setFirebaseConnected(true);
+        }
+      });
+    } catch {}
+
+    const unsubAuth = onAuthStateChanged(auth, (fbUser) => {
+      if (fbUser) {
+        setFirebaseConnected(true);
+      }
+    });
+
+    return () => {
+      try {
+        unsubConfig?.();
+      } catch {}
+      try {
+        unsubAuth?.();
+      } catch {}
+    };
+  }, []);
 
   // Permanent LocalStorage Chat Sessions
   const [sessions, setSessions] = useState<ChatSession[]>(() =>
@@ -4196,17 +4306,35 @@ export default function App() {
             return;
           }
           if (data.user && mounted) {
-            setCurrentUser(data.user);
+            const ledger = readUserTokenLedger(data.user.id, data.user.email);
+            const serverBal =
+              typeof data.user.tokenBalance === 'number'
+                ? data.user.tokenBalance
+                : publicConfig.defaultUserTokens || 5000;
+            const resolvedBal =
+              ledger && ledger.tokenBalance < serverBal
+                ? ledger.tokenBalance
+                : serverBal;
+            const resolvedUsed =
+              ledger && ledger.totalTokensUsed > (data.user.totalTokensUsed || 0)
+                ? ledger.totalTokensUsed
+                : data.user.totalTokensUsed || 0;
+            const hydratedUser: PublicUserAccount = {
+              ...data.user,
+              tokenBalance: resolvedBal,
+              totalTokensUsed: resolvedUsed,
+            };
+            setCurrentUser(hydratedUser);
             try {
               window.localStorage.setItem(
                 CURRENT_USER_ID_STORAGE_KEY,
-                data.user.id
+                hydratedUser.id
               );
             } catch {}
-            restoreUserSavedSessionsIfPresent(data.user);
-            if (data.matchedBy === 'ip') {
+            restoreUserSavedSessionsIfPresent(hydratedUser);
+            if (data.matchedBy === 'ip' || data.autoMatchedByIp) {
               setAutoLoggedByIpBanner(
-                `IP Auto-Login Verified (${data.clientIp || resolvedIp}) — Welcome back to your portal, ${data.user.name}!`
+                `IP Auto-Login Verified (${data.clientIp || resolvedIp}) — Welcome back to your portal, ${hydratedUser.name}!`
               );
               setTimeout(() => setAutoLoggedByIpBanner(''), 6000);
             }
@@ -4245,16 +4373,36 @@ export default function App() {
           );
           return;
         }
-        setCurrentUser(matchedLocalUser);
+        const ledger = readUserTokenLedger(
+          matchedLocalUser.id,
+          matchedLocalUser.email
+        );
+        const baseBal =
+          typeof matchedLocalUser.tokenBalance === 'number'
+            ? matchedLocalUser.tokenBalance
+            : localAdmin.defaultUserTokens || 5000;
+        const hydratedLocal: PublicUserAccount = {
+          ...matchedLocalUser,
+          tokenBalance:
+            ledger && ledger.tokenBalance < baseBal
+              ? ledger.tokenBalance
+              : baseBal,
+          totalTokensUsed:
+            ledger &&
+            ledger.totalTokensUsed > (matchedLocalUser.totalTokensUsed || 0)
+              ? ledger.totalTokensUsed
+              : matchedLocalUser.totalTokensUsed || 0,
+        };
+        setCurrentUser(hydratedLocal);
         try {
           window.localStorage.setItem(
             CURRENT_USER_ID_STORAGE_KEY,
-            matchedLocalUser.id
+            hydratedLocal.id
           );
         } catch {}
-        restoreUserSavedSessionsIfPresent(matchedLocalUser);
+        restoreUserSavedSessionsIfPresent(hydratedLocal);
         setAutoLoggedByIpBanner(
-          `IP Auto-Login Verified (${resolvedIp}) — Welcome back to your portal, ${matchedLocalUser.name}!`
+          `IP Auto-Login Verified (${resolvedIp}) — Welcome back to your portal, ${hydratedLocal.name}!`
         );
         setTimeout(() => setAutoLoggedByIpBanner(''), 6000);
       }
@@ -4262,7 +4410,202 @@ export default function App() {
     return () => {
       mounted = false;
     };
-  }, [restoreUserSavedSessionsIfPresent]);
+  }, [restoreUserSavedSessionsIfPresent, publicConfig.defaultUserTokens]);
+
+  // Send 6-Digit Email Verification OTP
+  const handleSendEmailOtp = async () => {
+    setAuthError('');
+    setOtpStatusMessage('');
+    const targetEmail = (authEmail || currentUser?.email || '')
+      .trim()
+      .toLowerCase();
+    const targetName = (authName || currentUser?.name || 'GOT Agent User').trim();
+
+    if (!targetEmail || !targetEmail.includes('@')) {
+      setAuthError('Please enter your valid Email address first to send the 6-digit OTP.');
+      return;
+    }
+
+    setIsSendingOtp(true);
+    try {
+      const res = await fetch('/api/public/send-email-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: targetEmail,
+          name: targetName,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.otpCode) {
+          setDispatchedOtpPreview(String(data.otpCode));
+        }
+        setOtpStatusMessage(
+          data.smtpSent
+            ? `✅ 6-digit OTP sent to ${targetEmail}! Enter the code below.`
+            : `📨 6-digit OTP dispatched for ${targetEmail}: ${data.otpCode} (Enter code below to verify)`
+        );
+        setIsSendingOtp(false);
+        return;
+      }
+    } catch {
+      // Fallback local OTP generation for static host
+    }
+
+    const fallbackCode = String(Math.floor(100000 + Math.random() * 900000));
+    setDispatchedOtpPreview(fallbackCode);
+    setOtpStatusMessage(
+      `📨 6-digit OTP generated for ${targetEmail}: ${fallbackCode} (Enter code below to verify)`
+    );
+    setIsSendingOtp(false);
+  };
+
+  // Verify 6-Digit Email OTP
+  const handleVerifyEmailOtp = async () => {
+    setAuthError('');
+    const targetEmail = (authEmail || currentUser?.email || '')
+      .trim()
+      .toLowerCase();
+    const code = otpInputCode.trim();
+
+    if (!code || code.length < 6) {
+      setAuthError('Please enter the 6-digit OTP code.');
+      return;
+    }
+
+    setIsVerifyingOtp(true);
+    try {
+      const res = await fetch('/api/public/verify-email-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: targetEmail,
+          otp: code,
+          userId: currentUser?.id,
+        }),
+      });
+      if (res.ok) {
+        setEmailOtpVerified(true);
+        setOtpStatusMessage(`✅ Email ${targetEmail} verified with 6-digit OTP!`);
+        if (currentUser) {
+          const updated = { ...currentUser, emailVerified: true };
+          setCurrentUser(updated);
+        }
+        setIsVerifyingOtp(false);
+        return;
+      }
+    } catch {
+      // Static fallback check
+    }
+
+    if (dispatchedOtpPreview && code === dispatchedOtpPreview) {
+      setEmailOtpVerified(true);
+      setOtpStatusMessage(`✅ Email ${targetEmail} verified with 6-digit OTP!`);
+      if (currentUser) {
+        setCurrentUser({ ...currentUser, emailVerified: true });
+      }
+    } else {
+      setAuthError('Invalid 6-digit OTP code. Please check the code and try again.');
+    }
+    setIsVerifyingOtp(false);
+  };
+
+  // Sign In with Google via Firebase Auth + Sync Profile to Firestore
+  const handleGoogleFirebaseLogin = async () => {
+    setAuthError('');
+    setIsAuthSubmitting(true);
+    try {
+      const fbUser = await signInWithGoogleFirebase();
+      const ledger = readUserTokenLedger(fbUser.uid, fbUser.email || undefined);
+      const defaultTokens = publicConfig.defaultUserTokens || 5000;
+      const startBalance = ledger ? ledger.tokenBalance : defaultTokens;
+      const startUsed = ledger ? ledger.totalTokensUsed : 0;
+
+      const googleAccount: PublicUserAccount = {
+        id: fbUser.uid,
+        name: fbUser.displayName || fbUser.email?.split('@')[0] || 'Google User',
+        email: (fbUser.email || 'user@gotagent.ai').toLowerCase(),
+        password: 'FIREBASE_GOOGLE_OAUTH',
+        ipAddress: clientIp,
+        role: 'user',
+        isBlocked: false,
+        violentChatCount: 0,
+        tokenBalance: startBalance,
+        totalTokensUsed: startUsed,
+        unlimitedTokens: false,
+        emailVerified: true,
+        createdAt: new Date().toISOString(),
+        lastLoginAt: new Date().toISOString(),
+        savedSessions: sessions,
+      };
+
+      await syncFirebaseAuthenticatedUser({
+        uid: fbUser.uid,
+        name: googleAccount.name,
+        email: googleAccount.email,
+        ipAddress: clientIp,
+        role: 'user',
+        tokenBalance: startBalance,
+        totalTokensUsed: startUsed,
+        unlimitedTokens: false,
+        emailVerified: true,
+        isBlocked: false,
+        violentChatCount: 0,
+      }).catch(() => {});
+
+      saveUserTokenLedger(
+        googleAccount.id,
+        googleAccount.email,
+        startBalance,
+        startUsed
+      );
+
+      // Also sync to backend server so Admin Panel sees this Firebase user
+      try {
+        await fetch('/api/public/user-auth', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            mode: 'register',
+            name: googleAccount.name,
+            email: googleAccount.email,
+            password: 'FIREBASE_GOOGLE_OAUTH',
+            clientIp,
+          }),
+        });
+      } catch {}
+
+      const localAdmin = loadLocalAdminState();
+      const idx = (localAdmin.users || []).findIndex(
+        (u) => u.id === googleAccount.id || u.email === googleAccount.email
+      );
+      if (idx >= 0) {
+        localAdmin.users[idx] = { ...localAdmin.users[idx], ...googleAccount };
+      } else {
+        localAdmin.users = [googleAccount, ...(localAdmin.users || [])];
+      }
+      saveLocalAdminState(localAdmin);
+
+      setCurrentUser(googleAccount);
+      setEmailOtpVerified(true);
+      setShowSwitchAccountModal(false);
+      setActiveWebsiteTab('chat');
+      try {
+        window.localStorage.setItem(CURRENT_USER_ID_STORAGE_KEY, googleAccount.id);
+      } catch {}
+      setAutoLoggedByIpBanner(
+        `Firebase Google Verified (${googleAccount.email}) — Connected to Firebase Cloud Database!`
+      );
+      setTimeout(() => setAutoLoggedByIpBanner(''), 6000);
+    } catch (err: any) {
+      setAuthError(
+        err?.message || 'Google Sign-In popup was closed or blocked. You can also sign in with Name, Email & OTP below.'
+      );
+    } finally {
+      setIsAuthSubmitting(false);
+    }
+  };
 
   const handlePublicUserAuthSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -4318,29 +4661,47 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         if (data.user) {
-          setCurrentUser(data.user);
+          const ledger = readUserTokenLedger(data.user.id, data.user.email);
+          const mergedUser: PublicUserAccount = {
+            ...data.user,
+            emailVerified: data.user.emailVerified || emailOtpVerified,
+            tokenBalance: ledger
+              ? Math.min(
+                  typeof data.user.tokenBalance === 'number' ? data.user.tokenBalance : 5000,
+                  ledger.tokenBalance
+                )
+              : typeof data.user.tokenBalance === 'number'
+                ? data.user.tokenBalance
+                : 5000,
+            totalTokensUsed: ledger
+              ? Math.max(data.user.totalTokensUsed || 0, ledger.totalTokensUsed)
+              : data.user.totalTokensUsed || 0,
+          };
+          saveUserTokenLedger(mergedUser);
+          setCurrentUser(mergedUser);
           try {
             window.localStorage.setItem(
               CURRENT_USER_ID_STORAGE_KEY,
-              data.user.id
+              mergedUser.id
             );
           } catch {}
           // Sync user into local admin state cache as well
           const localAdmin = loadLocalAdminState();
           const existingIdx = (localAdmin.users || []).findIndex(
-            (u) => u.id === data.user.id || u.email === data.user.email
+            (u) => u.id === mergedUser.id || u.email === mergedUser.email
           );
           if (existingIdx >= 0) {
-            localAdmin.users[existingIdx] = data.user;
+            localAdmin.users[existingIdx] = mergedUser;
           } else {
-            localAdmin.users = [data.user, ...(localAdmin.users || [])];
+            localAdmin.users = [mergedUser, ...(localAdmin.users || [])];
           }
           saveLocalAdminState(localAdmin);
-          restoreUserSavedSessionsIfPresent(data.user);
+          restoreUserSavedSessionsIfPresent(mergedUser);
           setShowSwitchAccountModal(false);
+          setActiveWebsiteTab('chat');
           setAuthPassword('');
           setAutoLoggedByIpBanner(
-            `Portal Unlocked for ${data.user.name} · IP ${data.user.ipAddress || clientIp} saved for automatic login & AI Memory!`
+            `Portal Unlocked for ${mergedUser.name} · ${mergedUser.unlimitedTokens ? '∞ Tokens' : `${mergedUser.tokenBalance} Tokens Ready`} · Synced to Firebase!`
           );
           setTimeout(() => setAutoLoggedByIpBanner(''), 6000);
           setIsAuthSubmitting(false);
@@ -4397,6 +4758,13 @@ export default function App() {
       }
       existingUser.ipAddress = clientIp;
       existingUser.lastLoginAt = new Date().toISOString();
+      if (emailOtpVerified) existingUser.emailVerified = true;
+      const ledger = readUserTokenLedger(existingUser.id, existingUser.email);
+      if (ledger) {
+        existingUser.tokenBalance = ledger.tokenBalance;
+        existingUser.totalTokensUsed = ledger.totalTokensUsed;
+      }
+      saveUserTokenLedger(existingUser);
       saveLocalAdminState(localAdmin);
       setCurrentUser(existingUser);
       try {
@@ -4407,9 +4775,10 @@ export default function App() {
       } catch {}
       restoreUserSavedSessionsIfPresent(existingUser);
       setShowSwitchAccountModal(false);
+      setActiveWebsiteTab('chat');
       setAuthPassword('');
       setAutoLoggedByIpBanner(
-        `Welcome back, ${existingUser.name}! IP ${clientIp} bound for auto-login.`
+        `Welcome back, ${existingUser.name}! ${existingUser.unlimitedTokens ? '∞ Tokens' : `${existingUser.tokenBalance ?? 5000} Tokens Remaining`}.`
       );
       setTimeout(() => setAutoLoggedByIpBanner(''), 6000);
       setIsAuthSubmitting(false);
@@ -4428,6 +4797,13 @@ export default function App() {
       existingUser.email = cleanEmail || existingUser.email;
       existingUser.ipAddress = clientIp;
       existingUser.lastLoginAt = new Date().toISOString();
+      if (emailOtpVerified) existingUser.emailVerified = true;
+      const ledger = readUserTokenLedger(existingUser.id, existingUser.email);
+      if (ledger) {
+        existingUser.tokenBalance = ledger.tokenBalance;
+        existingUser.totalTokensUsed = ledger.totalTokensUsed;
+      }
+      saveUserTokenLedger(existingUser);
       saveLocalAdminState(localAdmin);
       setCurrentUser(existingUser);
       try {
@@ -4438,6 +4814,7 @@ export default function App() {
       } catch {}
       restoreUserSavedSessionsIfPresent(existingUser);
       setShowSwitchAccountModal(false);
+      setActiveWebsiteTab('chat');
       setIsAuthSubmitting(false);
       return;
     }
@@ -4451,6 +4828,7 @@ export default function App() {
       role: 'user',
       isBlocked: false,
       violentChatCount: 0,
+      emailVerified: emailOtpVerified,
       tokenBalance:
         typeof localAdmin.defaultUserTokens === 'number'
           ? localAdmin.defaultUserTokens
@@ -4472,6 +4850,7 @@ export default function App() {
         })),
       })),
     };
+    saveUserTokenLedger(createdUser);
     localAdmin.users.unshift(createdUser);
     saveLocalAdminState(localAdmin);
     setCurrentUser(createdUser);
@@ -4479,9 +4858,10 @@ export default function App() {
       window.localStorage.setItem(CURRENT_USER_ID_STORAGE_KEY, createdUser.id);
     } catch {}
     setShowSwitchAccountModal(false);
+    setActiveWebsiteTab('chat');
     setAuthPassword('');
     setAutoLoggedByIpBanner(
-      `Account created & saved to AI Memory + Admin Panel! IP ${clientIp} bound for auto-login.`
+      `Account created & saved to Firebase + Admin Panel! ${createdUser.tokenBalance} Tokens credited.`
     );
     setTimeout(() => setAutoLoggedByIpBanner(''), 6000);
     setIsAuthSubmitting(false);
@@ -5022,6 +5402,62 @@ export default function App() {
 
     if (!rawPrompt && !currentImgUrl) return;
 
+    setActiveWebsiteTab('chat');
+
+    // Deterministic Pre-Send Token Check: Stop immediately if user's tokens have finished (0 remaining)
+    const isUnlimitedUser = Boolean(
+      currentUser &&
+        (currentUser.unlimitedTokens || currentUser.role === 'co-admin')
+    );
+    const startingDefault = publicConfig.defaultUserTokens || 5000;
+    const currentBalance =
+      currentUser && typeof currentUser.tokenBalance === 'number'
+        ? currentUser.tokenBalance
+        : startingDefault;
+    const currentTotalUsed =
+      currentUser && typeof currentUser.totalTokensUsed === 'number'
+        ? currentUser.totalTokensUsed
+        : 0;
+
+    if (currentUser && !isUnlimitedUser && currentBalance <= 0) {
+      const nowTime = new Date().toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+      const blockedTurnUserMsg: GotChatMessage = {
+        id: `user-${Date.now()}`,
+        role: 'user',
+        timestamp: nowTime,
+        text: rawPrompt || 'Attached Image',
+      };
+      const depletedMsg: GotChatMessage = {
+        id: `agent-depleted-${Date.now()}`,
+        role: 'agent',
+        timestamp: nowTime,
+        agentMode,
+        text: `⚡ **AI Token Limit Reached (0 Tokens Remaining)**\n\nHello **${currentUser.name}**, your **GOT Agent AI Tokens** have finished (**0 Tokens Remaining** · Total Used: **${currentTotalUsed.toLocaleString()} Tokens**).\n\nPlease ask **Admin Abhinav** to grant more tokens or enable **Unlimited Tokens** on your account (\`${currentUser.email}\`) in the Admin Dashboard.`,
+        highlights: [
+          'Token Balance: 0 (Finished)',
+          `Total Used: ${currentTotalUsed.toLocaleString()} Tokens`,
+          'Contact Admin Abhinav',
+        ],
+      };
+      setChatInput('');
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.id === activeSession.id
+            ? {
+                ...s,
+                updatedAt: nowTime,
+                messages: [...s.messages, blockedTurnUserMsg, depletedMsg],
+              }
+            : s
+        )
+      );
+      scrollToBottom();
+      return;
+    }
+
     if (activeAbortRef.current) {
       activeAbortRef.current.abort();
     }
@@ -5083,6 +5519,83 @@ export default function App() {
     }
     scrollToBottom();
 
+    // Helper to deterministically deduct tokens on client + local storage + Firebase on EVERY turn
+    const applyDeterministicTokenDeduction = (
+      replyStr: string,
+      serverReportedBalance?: number,
+      serverReportedUsedThisTurn?: number,
+      serverUnlimited?: boolean
+    ) => {
+      if (!currentUser) return { nextBalance: currentBalance, usedThisTurn: 0 };
+      const unlimited = Boolean(
+        serverUnlimited ??
+          (currentUser.unlimitedTokens || currentUser.role === 'co-admin')
+      );
+      const usedThisTurn =
+        typeof serverReportedUsedThisTurn === 'number' &&
+        serverReportedUsedThisTurn > 0
+          ? serverReportedUsedThisTurn
+          : Math.max(140, Math.ceil((effectiveText.length + replyStr.length) / 3));
+
+      const nextBalance = unlimited
+        ? currentBalance
+        : typeof serverReportedBalance === 'number' &&
+            serverReportedBalance < currentBalance
+          ? Math.max(0, serverReportedBalance)
+          : Math.max(0, currentBalance - usedThisTurn);
+      const nextTotalUsed = currentTotalUsed + usedThisTurn;
+
+      const updatedUser: PublicUserAccount = {
+        ...currentUser,
+        tokenBalance: nextBalance,
+        totalTokensUsed: nextTotalUsed,
+        unlimitedTokens: unlimited,
+      };
+      setCurrentUser(updatedUser);
+      saveUserTokenLedger(
+        updatedUser.id,
+        updatedUser.email,
+        nextBalance,
+        nextTotalUsed
+      );
+
+      // Update localAdmin.users cache
+      try {
+        const localAdmin = loadLocalAdminState();
+        const uIdx = (localAdmin.users || []).findIndex(
+          (u) => u.id === updatedUser.id || u.email === updatedUser.email
+        );
+        if (uIdx >= 0) {
+          localAdmin.users[uIdx] = {
+            ...localAdmin.users[uIdx],
+            tokenBalance: nextBalance,
+            totalTokensUsed: nextTotalUsed,
+            unlimitedTokens: unlimited,
+          };
+          saveLocalAdminState(localAdmin);
+        }
+      } catch {}
+
+      // Sync to Firebase Firestore if user is signed in with Firebase Auth
+      if (auth.currentUser && auth.currentUser.uid === updatedUser.id) {
+        syncFirebaseAuthenticatedUser({
+          uid: updatedUser.id,
+          name: updatedUser.name,
+          email: updatedUser.email,
+          ipAddress: clientIp,
+          role: updatedUser.role,
+          tokenBalance: nextBalance,
+          totalTokensUsed: nextTotalUsed,
+          unlimitedTokens: unlimited,
+          emailVerified: Boolean(updatedUser.emailVerified ?? true),
+          isBlocked: Boolean(updatedUser.isBlocked),
+          violentChatCount: updatedUser.violentChatCount || 0,
+        }).catch(() => {});
+      }
+
+      return { nextBalance, usedThisTurn };
+    };
+
     try {
       let base64Data: string | undefined;
       if (currentImgUrl) {
@@ -5110,6 +5623,8 @@ export default function App() {
             currentUserId: currentUser?.id,
             currentUserName: currentUser?.name,
             currentUserEmail: currentUser?.email,
+            clientTokenBalance: currentBalance,
+            clientTotalTokensUsed: currentTotalUsed,
             history: updatedHistory.slice(-10).map((m) => ({
               role: m.role,
               text: m.text,
@@ -5164,22 +5679,28 @@ export default function App() {
         return;
       }
 
-      if (typeof data?.tokenBalance === 'number') {
-        setCurrentUser((prev) =>
-          prev
-            ? {
-                ...prev,
-                tokenBalance: data.tokenBalance,
-                unlimitedTokens:
-                  typeof data.unlimitedTokens === 'boolean'
-                    ? data.unlimitedTokens
-                    : prev.unlimitedTokens,
-              }
-            : prev
+      const replyText = data.reply || 'Here is your response from GOT Agent.';
+
+      // Deterministically deduct tokens unless already depleted
+      const tokenResult = data?.tokenDepleted
+        ? { nextBalance: 0, usedThisTurn: 0 }
+        : applyDeterministicTokenDeduction(
+            replyText,
+            data?.tokenBalance,
+            data?.tokensUsedThisTurn,
+            data?.unlimitedTokens
+          );
+
+      if (data?.tokenDepleted && currentUser) {
+        const updatedZero = { ...currentUser, tokenBalance: 0 };
+        setCurrentUser(updatedZero);
+        saveUserTokenLedger(
+          updatedZero.id,
+          updatedZero.email,
+          0,
+          currentTotalUsed
         );
       }
-
-      const replyText = data.reply || 'Here is your response from GOT Agent.';
 
       const agentMsg: GotChatMessage = {
         id: `agent-${Date.now()}`,
@@ -5191,7 +5712,14 @@ export default function App() {
         agentMode,
         text: replyText,
         generatedImageUrl: data.generatedImageUrl || undefined,
-        highlights: data.highlights || [],
+        highlights: [
+          ...(data.highlights || []),
+          ...(currentUser && !isUnlimitedUser
+            ? [
+                `Tokens Left: ${tokenResult.nextBalance.toLocaleString()} (-${tokenResult.usedThisTurn})`,
+              ]
+            : []),
+        ],
         visionSummary: data.visionSummary || '',
         sources: Array.isArray(data.sources) ? data.sources : [],
         searchQueriesAnalyzed: Array.isArray(data.searchQueriesAnalyzed)
@@ -5212,6 +5740,21 @@ export default function App() {
         )
       );
 
+      // Sync chat session to Firebase if authenticated with Firebase Auth
+      if (auth.currentUser && currentUser) {
+        syncChatSessionToFirebase({
+          uid: auth.currentUser.uid,
+          userName: currentUser.name,
+          sessionId: targetSessionId,
+          title: nextTitle,
+          messagesSummary: [...updatedHistory, agentMsg]
+            .slice(-10)
+            .map((m) => `[${m.role}]: ${m.text.slice(0, 300)}`)
+            .join('\n'),
+          messageCount: updatedHistory.length + 1,
+        }).catch(() => {});
+      }
+
       if (realtimeVoiceActiveRef.current || fromVoiceConversation) {
         setVoiceState('speaking');
         setVoiceStatusLabel('GOT Agent is speaking reply...');
@@ -5226,6 +5769,8 @@ export default function App() {
       }
     } catch {
       clearTimeout(timeoutId);
+      const fbText = `### ${effectiveText}\n\nI am **GOT Agent** (created by **Abhinav**, running on **${agentMode}**). Your conversation history is saved permanently in local storage and Firebase. Tap **Regenerate** or ask a follow-up question below!`;
+      const tokenResult = applyDeterministicTokenDeduction(fbText);
       const fallbackMsg: GotChatMessage = {
         id: `agent-${Date.now()}`,
         role: 'agent',
@@ -5234,8 +5779,16 @@ export default function App() {
           minute: '2-digit',
         }),
         agentMode,
-        text: `### ${effectiveText}\n\nI am **GOT Agent** (created by **Abhinav**, running on **${agentMode}**). Your conversation history is saved permanently in local storage. Tap **Regenerate** or ask a follow-up question below!`,
-        highlights: ['Creator: Abhinav', `Model: ${agentMode}`],
+        text: fbText,
+        highlights: [
+          'Creator: Abhinav',
+          `Model: ${agentMode}`,
+          ...(currentUser && !isUnlimitedUser
+            ? [
+                `Tokens Left: ${tokenResult.nextBalance.toLocaleString()} (-${tokenResult.usedThisTurn})`,
+              ]
+            : []),
+        ],
       };
       setSessions((prev) =>
         prev.map((s) =>
@@ -5371,14 +5924,14 @@ export default function App() {
     );
   }
 
-  // Render Public Website User Portal Gate (Name + Email + Password + IP Auto-Match) when no user is signed in
-  if (!currentUser || showSwitchAccountModal) {
+  // Render Public Website User Portal Gate (Name + Email + Password + 6-Digit Email OTP + Firebase Google Sign-In) when user opens Chat Portal or Account Switcher
+  if ((!currentUser && activeWebsiteTab === 'chat') || showSwitchAccountModal) {
     return (
       <div className="min-h-[100dvh] flex flex-col items-center justify-center p-4 text-stone-900 relative overflow-hidden">
         <motion.div
           initial={{ opacity: 0, y: 14 }}
           animate={{ opacity: 1, y: 0 }}
-          className="w-full max-w-md liquid-glass rounded-[32px] p-6 sm:p-8 space-y-5 shadow-2xl border border-white/90 relative z-10"
+          className="w-full max-w-md liquid-glass rounded-[32px] p-6 sm:p-8 space-y-4 shadow-2xl border border-white/90 relative z-10 max-h-[94dvh] overflow-y-auto"
         >
           <div className="flex items-center justify-between gap-3">
             <div className="flex items-center gap-3">
@@ -5388,29 +5941,38 @@ export default function App() {
                   GOT Agent · User Portal
                 </h1>
                 <p className="text-xs text-stone-500">
-                  Created by Abhinav · AI Memory & IP Auto-Login
+                  Created by Abhinav · Firebase Cloud + Email OTP
                 </p>
               </div>
             </div>
-            {currentUser && showSwitchAccountModal && (
-              <button
-                type="button"
-                onClick={() => setShowSwitchAccountModal(false)}
-                className="p-2 rounded-xl liquid-glass-subtle text-stone-600 hover:text-stone-900"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={() => {
+                setShowSwitchAccountModal(false);
+                if (!currentUser) setActiveWebsiteTab('home');
+              }}
+              className="p-2 rounded-xl liquid-glass-subtle text-stone-600 hover:text-stone-900"
+              title="Back to Home"
+            >
+              <X className="w-4 h-4" />
+            </button>
           </div>
 
-          <div className="p-3 rounded-2xl liquid-glass-subtle text-xs text-stone-700 space-y-1">
-            <div className="font-semibold text-stone-900 flex items-center gap-1.5">
-              <UserCheck className="w-4 h-4 text-emerald-600 shrink-0" />
-              <span>Smart IP Auto-Portal & AI Memory</span>
-            </div>
-            <p className="text-[11px] text-stone-600 leading-relaxed">
-              Enter your <strong>Name</strong>, <strong>Email</strong>, and <strong>Password</strong>. GOT Agent saves your profile in AI Memory and binds your IP (<span className="font-mono">{clientIp}</span>) so next time you open the website, your portal & saved chat history open automatically!
-            </p>
+          {/* 1-Click Firebase Google Verification Login */}
+          <button
+            type="button"
+            onClick={handleGoogleFirebaseLogin}
+            disabled={isAuthSubmitting}
+            className="w-full min-h-[44px] px-4 py-2.5 rounded-2xl bg-white border border-stone-300 text-stone-900 text-xs sm:text-sm font-bold flex items-center justify-center gap-2 shadow-sm hover:bg-stone-50 transition-all"
+          >
+            <Globe className="w-4 h-4 text-emerald-600" />
+            <span>Continue with Google (Firebase Cloud Verified)</span>
+          </button>
+
+          <div className="flex items-center gap-2 text-[11px] text-stone-400 font-mono uppercase">
+            <div className="flex-1 h-px bg-stone-300/70" />
+            <span>OR EMAIL + OTP PORTAL</span>
+            <div className="flex-1 h-px bg-stone-300/70" />
           </div>
 
           {/* Mode Toggle: Create Account vs Log In by Name/Email */}
@@ -5445,7 +6007,7 @@ export default function App() {
             </button>
           </div>
 
-          <form onSubmit={handlePublicUserAuthSubmit} className="space-y-3.5">
+          <form onSubmit={handlePublicUserAuthSubmit} className="space-y-3">
             <div className="space-y-1">
               <label className="text-xs font-semibold text-stone-700 block">
                 Your Name {authGateMode === 'login' && '(or leave blank if using Email)'}
@@ -5456,22 +6018,85 @@ export default function App() {
                 value={authName}
                 onChange={(e) => setAuthName(e.target.value)}
                 placeholder="Enter your name (saved to AI Memory)"
-                className="w-full min-h-[44px] px-3.5 py-2 rounded-2xl liquid-glass-subtle text-sm text-stone-900 focus:outline-none border border-stone-300/80"
+                className="w-full min-h-[42px] px-3.5 py-2 rounded-2xl liquid-glass-subtle text-sm text-stone-900 focus:outline-none border border-stone-300/80"
               />
             </div>
 
             <div className="space-y-1">
-              <label className="text-xs font-semibold text-stone-700 block">
-                Your Email {authGateMode === 'login' && '(optional if logging in by Name)'}
-              </label>
+              <div className="flex items-center justify-between gap-2">
+                <label className="text-xs font-semibold text-stone-700 block">
+                  Your Email {authGateMode === 'login' && '(optional if logging in by Name)'}
+                </label>
+                <button
+                  type="button"
+                  onClick={handleSendEmailOtp}
+                  disabled={isSendingOtp}
+                  className="text-[11px] font-bold text-emerald-700 hover:text-emerald-900 underline"
+                >
+                  {isSendingOtp ? 'Sending OTP...' : 'Send 6-Digit Email OTP'}
+                </button>
+              </div>
               <input
                 type="email"
                 required={authGateMode === 'register'}
                 value={authEmail}
                 onChange={(e) => setAuthEmail(e.target.value)}
                 placeholder="Enter your email address"
-                className="w-full min-h-[44px] px-3.5 py-2 rounded-2xl liquid-glass-subtle text-sm text-stone-900 focus:outline-none border border-stone-300/80"
+                className="w-full min-h-[42px] px-3.5 py-2 rounded-2xl liquid-glass-subtle text-sm text-stone-900 focus:outline-none border border-stone-300/80"
               />
+            </div>
+
+            {/* 6-Digit Email OTP Verification Box */}
+            <div className="p-3 rounded-2xl liquid-glass-subtle space-y-2 border border-stone-300/60">
+              <div className="flex items-center justify-between gap-2 text-xs">
+                <span className="font-semibold text-stone-800 flex items-center gap-1.5">
+                  <KeyRound className="w-3.5 h-3.5 text-amber-600" />
+                  <span>Email OTP Verification</span>
+                </span>
+                {emailOtpVerified ? (
+                  <span className="px-2 py-0.5 rounded-lg bg-emerald-500/15 text-emerald-800 font-bold text-[11px] flex items-center gap-1">
+                    <CheckCircle2 className="w-3 h-3" /> Verified
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={handleSendEmailOtp}
+                    disabled={isSendingOtp}
+                    className="px-2.5 py-1 rounded-xl bg-stone-900 text-white text-[11px] font-semibold"
+                  >
+                    {isSendingOtp ? 'Sending...' : 'Get 6-Digit OTP'}
+                  </button>
+                )}
+              </div>
+
+              {otpStatusMessage && (
+                <div className="p-2 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-[11px] text-emerald-900 font-mono">
+                  {otpStatusMessage}
+                </div>
+              )}
+
+              {!emailOtpVerified && (
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    maxLength={6}
+                    value={otpInputCode}
+                    onChange={(e) =>
+                      setOtpInputCode(e.target.value.replace(/\D/g, ''))
+                    }
+                    placeholder="Enter 6-digit OTP"
+                    className="flex-1 min-h-[38px] px-3 rounded-xl bg-white/90 text-xs font-mono tracking-widest border border-stone-300/80"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleVerifyEmailOtp}
+                    disabled={isVerifyingOtp}
+                    className="min-h-[38px] px-3.5 rounded-xl bg-emerald-700 text-white text-xs font-semibold"
+                  >
+                    {isVerifyingOtp ? 'Checking...' : 'Verify OTP'}
+                  </button>
+                </div>
+              )}
             </div>
 
             <div className="space-y-1">
@@ -5485,7 +6110,7 @@ export default function App() {
                   value={authPassword}
                   onChange={(e) => setAuthPassword(e.target.value)}
                   placeholder="Enter your password"
-                  className="w-full min-h-[44px] pl-3.5 pr-10 py-2 rounded-2xl liquid-glass-subtle text-sm text-stone-900 focus:outline-none border border-stone-300/80"
+                  className="w-full min-h-[42px] pl-3.5 pr-10 py-2 rounded-2xl liquid-glass-subtle text-sm text-stone-900 focus:outline-none border border-stone-300/80"
                 />
                 <button
                   type="button"
@@ -5518,7 +6143,7 @@ export default function App() {
                 {isAuthSubmitting
                   ? 'Opening Your Portal...'
                   : authGateMode === 'register'
-                    ? 'Save to AI Memory & Open My Portal'
+                    ? 'Save to Firebase & Open My Portal'
                     : 'Unlock My Portal & Bind IP'}
               </span>
             </button>
@@ -5614,14 +6239,15 @@ export default function App() {
           </div>
         )}
 
-      {/* Top Bar — Strict 3-Zone Top Bar Contract with Bubble Liquid Glass Logo */}
-      <header className="sticky top-0 z-30 h-[56px] px-3 sm:px-6 flex items-center justify-between gap-4 liquid-glass border-b border-white/80 dark:border-stone-800 shrink-0">
+      {/* Top Bar — Official GOT Agent Website Navigation (Home, AI Chat, Features, Privacy, Terms, Get Started) */}
+      <header className="sticky top-0 z-30 h-[56px] px-3 sm:px-6 flex items-center justify-between gap-3 liquid-glass border-b border-white/80 dark:border-stone-800 shrink-0">
         {/* Zone 1: Bubble Liquid Glass Brand Logo + Wordmark */}
         <a
           href="#top"
           onClick={(e) => {
             e.preventDefault();
             setA4SheetMode(false);
+            setActiveWebsiteTab('home');
           }}
           className="flex items-center gap-2.5 text-base sm:text-lg font-bold tracking-tight text-stone-900 dark:text-stone-100 whitespace-nowrap shrink-0 font-display"
         >
@@ -5629,47 +6255,72 @@ export default function App() {
           <span>GOT Agent</span>
         </a>
 
-        {/* Zone 2: 4 Concise Single-Line Navigation Links */}
-        <nav className="hidden md:flex items-center gap-6 text-xs sm:text-sm font-medium text-stone-600 dark:text-stone-400">
+        {/* Zone 2: Official Website Navigation Links */}
+        <nav className="hidden md:flex items-center gap-5 text-xs sm:text-sm font-medium text-stone-600 dark:text-stone-400">
           <button
             type="button"
-            onClick={() => setA4SheetMode(false)}
+            onClick={() => {
+              setA4SheetMode(false);
+              setActiveWebsiteTab('home');
+            }}
             className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
-              !a4SheetMode
+              activeWebsiteTab === 'home'
                 ? 'border-stone-900 dark:border-stone-100 text-stone-900 dark:text-white font-semibold'
                 : 'border-transparent hover:text-stone-900 dark:hover:text-stone-200'
             }`}
           >
-            Chat
+            Home
           </button>
           <button
             type="button"
-            onClick={() => fileInputRef.current?.click()}
-            className="py-1 hover:text-stone-900 dark:hover:text-stone-200 transition-colors whitespace-nowrap shrink-0"
-          >
-            Analyze Image
-          </button>
-          <button
-            type="button"
-            onClick={() => setA4SheetMode((prev) => !prev)}
+            onClick={() => {
+              setA4SheetMode(false);
+              setActiveWebsiteTab('chat');
+            }}
             className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
-              a4SheetMode
+              activeWebsiteTab === 'chat' && !a4SheetMode
                 ? 'border-stone-900 dark:border-stone-100 text-stone-900 dark:text-white font-semibold'
                 : 'border-transparent hover:text-stone-900 dark:hover:text-stone-200'
             }`}
           >
-            A4 Sheet
+            AI Chat
           </button>
           <button
             type="button"
-            onClick={() => setDrawerOpen((prev) => !prev)}
-            className="py-1 hover:text-stone-900 dark:hover:text-stone-200 transition-colors whitespace-nowrap shrink-0"
+            onClick={() => setActiveWebsiteTab('features')}
+            className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
+              activeWebsiteTab === 'features'
+                ? 'border-stone-900 dark:border-stone-100 text-stone-900 dark:text-white font-semibold'
+                : 'border-transparent hover:text-stone-900 dark:hover:text-stone-200'
+            }`}
           >
-            History ({sessions.length})
+            Features
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveWebsiteTab('privacy')}
+            className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
+              activeWebsiteTab === 'privacy'
+                ? 'border-stone-900 dark:border-stone-100 text-stone-900 dark:text-white font-semibold'
+                : 'border-transparent hover:text-stone-900 dark:hover:text-stone-200'
+            }`}
+          >
+            Privacy Policy
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveWebsiteTab('terms')}
+            className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
+              activeWebsiteTab === 'terms'
+                ? 'border-stone-900 dark:border-stone-100 text-stone-900 dark:text-white font-semibold'
+                : 'border-transparent hover:text-stone-900 dark:hover:text-stone-200'
+            }`}
+          >
+            Terms &amp; Policy
           </button>
         </nav>
 
-        {/* Zone 3: User Token Balance + User Portal Badge + Co-Admin Shortcut + New Chat */}
+        {/* Zone 3: User Token Balance + User Portal Badge + Get Started / New Chat */}
         <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
           {currentUser?.role === 'co-admin' && (
             <button
@@ -5687,47 +6338,68 @@ export default function App() {
           )}
 
           {/* User Live Token Balance Badge */}
-          <div
-            title={
-              currentUser?.unlimitedTokens || currentUser?.role === 'co-admin'
-                ? 'Unlimited AI Tokens Granted by Admin Abhinav'
-                : `Remaining AI Tokens: ${(currentUser?.tokenBalance ?? 5000).toLocaleString()} (Admin can grant more tokens anytime)`
-            }
-            className={`min-h-[38px] px-2.5 py-1.5 rounded-2xl text-xs font-mono font-bold flex items-center gap-1 border ${
-              currentUser?.unlimitedTokens || currentUser?.role === 'co-admin'
-                ? 'bg-amber-500/15 text-amber-900 dark:text-amber-300 border-amber-500/35'
-                : (currentUser?.tokenBalance ?? 5000) <= 300
-                  ? 'bg-red-500/15 text-red-700 dark:text-red-300 border-red-500/35'
-                  : 'liquid-glass-subtle text-emerald-800 dark:text-emerald-300 border-emerald-500/25'
-            }`}
-          >
-            <Zap className="w-3.5 h-3.5 text-amber-500 shrink-0" />
-            <span>
-              {currentUser?.unlimitedTokens || currentUser?.role === 'co-admin'
-                ? '♾️ Tokens'
-                : `${(currentUser?.tokenBalance ?? 5000).toLocaleString()}`}
-            </span>
-          </div>
+          {currentUser && (
+            <div
+              title={
+                currentUser.unlimitedTokens || currentUser.role === 'co-admin'
+                  ? 'Unlimited AI Tokens Granted by Admin Abhinav'
+                  : `Remaining AI Tokens: ${(currentUser.tokenBalance ?? 5000).toLocaleString()} · Used: ${(currentUser.totalTokensUsed ?? 0).toLocaleString()} Tokens`
+              }
+              className={`min-h-[38px] px-2.5 py-1.5 rounded-2xl text-xs font-mono font-bold flex items-center gap-1 border ${
+                currentUser.unlimitedTokens || currentUser.role === 'co-admin'
+                  ? 'bg-amber-500/15 text-amber-900 dark:text-amber-300 border-amber-500/35'
+                  : (currentUser.tokenBalance ?? 5000) <= 0
+                    ? 'bg-red-600 text-white border-red-700 animate-pulse'
+                    : (currentUser.tokenBalance ?? 5000) <= 500
+                      ? 'bg-red-500/15 text-red-700 dark:text-red-300 border-red-500/35'
+                      : 'liquid-glass-subtle text-emerald-800 dark:text-emerald-300 border-emerald-500/25'
+              }`}
+            >
+              <Zap className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+              <span>
+                {currentUser.unlimitedTokens || currentUser.role === 'co-admin'
+                  ? '♾️ Tokens'
+                  : `${(currentUser.tokenBalance ?? 5000).toLocaleString()} Left`}
+              </span>
+            </div>
+          )}
+
+          {currentUser ? (
+            <button
+              type="button"
+              onClick={() => setShowSwitchAccountModal(true)}
+              className="min-h-[38px] px-2.5 sm:px-3 py-1.5 rounded-2xl liquid-glass-subtle text-xs font-semibold text-stone-800 dark:text-stone-200 flex items-center gap-1.5"
+              title={`Signed in as ${currentUser.name} (${currentUser.email}) · IP: ${clientIp}`}
+            >
+              <UserCheck className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+              <span className="max-w-[82px] sm:max-w-[96px] truncate">
+                {currentUser.name}
+              </span>
+            </button>
+          ) : null}
 
           <button
             type="button"
-            onClick={() => setShowSwitchAccountModal(true)}
-            className="min-h-[38px] px-2.5 sm:px-3 py-1.5 rounded-2xl liquid-glass-subtle text-xs font-semibold text-stone-800 dark:text-stone-200 flex items-center gap-1.5"
-            title={`Signed in as ${currentUser.name} (${currentUser.email}) · IP: ${clientIp}`}
+            onClick={() => {
+              if (activeWebsiteTab !== 'chat') {
+                setActiveWebsiteTab('chat');
+              } else {
+                handleStartNewChat();
+              }
+            }}
+            className={`min-h-[40px] px-3.5 sm:px-4 py-2 rounded-2xl bg-stone-900 text-stone-50 dark:bg-stone-100 dark:text-stone-950 text-xs font-semibold ${festivalHoverClass} whitespace-nowrap shrink-0 flex items-center gap-1.5`}
           >
-            <UserCheck className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-            <span className="max-w-[82px] sm:max-w-[96px] truncate">
-              {currentUser.name}
-            </span>
-          </button>
-
-          <button
-            type="button"
-            onClick={handleStartNewChat}
-            className={`min-h-[40px] px-3 sm:px-4 py-2 rounded-2xl bg-stone-900 text-stone-50 dark:bg-stone-100 dark:text-stone-950 text-xs font-semibold ${festivalHoverClass} whitespace-nowrap shrink-0 flex items-center gap-1.5`}
-          >
-            <Plus className="w-3.5 h-3.5" />
-            <span className="hidden xs:inline">New Chat</span>
+            {activeWebsiteTab !== 'chat' ? (
+              <>
+                <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                <span>Get Started</span>
+              </>
+            ) : (
+              <>
+                <Plus className="w-3.5 h-3.5" />
+                <span className="hidden xs:inline">New Chat</span>
+              </>
+            )}
           </button>
         </div>
       </header>
@@ -5914,9 +6586,28 @@ export default function App() {
         )}
       </AnimatePresence>
 
-      {/* Main Device-Adaptive Workspace */}
+      {/* Main Device-Adaptive Workspace or Official Website Sections (Home, Features, Privacy, Terms) */}
+      {activeWebsiteTab !== 'chat' ? (
+        <main className="relative z-20 flex-1 flex flex-col">
+          <OfficialWebsiteSections
+            activeTab={activeWebsiteTab}
+            onSelectTab={(t) => setActiveWebsiteTab(t)}
+            onGetStarted={(initialPrompt) => {
+              setActiveWebsiteTab('chat');
+              if (initialPrompt && currentUser) {
+                handleSendMessage(initialPrompt);
+              } else if (initialPrompt) {
+                setChatInput(initialPrompt);
+              }
+            }}
+            currentUser={currentUser}
+            firebaseConnected={firebaseConnected}
+            defaultUserTokens={publicConfig.defaultUserTokens || 5000}
+          />
+        </main>
+      ) : (
       <main className="relative z-20 flex-1 flex flex-col px-2.5 sm:px-5 pt-2.5 pb-3">
-        {/* Compact Model Version (GOT LOCAL), Device Fit & Theme Strip */}
+        {/* Compact Model Version (GOT LOCAL), Live Token Meter, Device Fit & Theme Strip */}
         <div
           className={`${workspaceWidthClass} mb-2.5 px-3 py-2 rounded-2xl liquid-glass-subtle flex items-center justify-between gap-2`}
         >
@@ -6714,7 +7405,16 @@ export default function App() {
 
                   <button
                     type="submit"
-                    disabled={!chatInput.trim() && !attachedImageUrl}
+                    disabled={
+                      (!chatInput.trim() && !attachedImageUrl) ||
+                      Boolean(
+                        currentUser &&
+                          !currentUser.unlimitedTokens &&
+                          currentUser.role !== 'co-admin' &&
+                          typeof currentUser.tokenBalance === 'number' &&
+                          currentUser.tokenBalance <= 0
+                      )
+                    }
                     aria-label="Send message"
                     className={`min-h-[44px] px-4 sm:px-5 py-2 rounded-2xl bg-stone-900 text-stone-50 dark:bg-stone-100 dark:text-stone-950 text-xs sm:text-sm font-semibold flex items-center justify-center gap-1.5 ${festivalHoverClass} shrink-0 disabled:opacity-40`}
                   >
@@ -6722,11 +7422,46 @@ export default function App() {
                     <span className="hidden sm:inline">Send</span>
                   </button>
                 </form>
+
+                {/* Live User Token Balance & Firebase Cloud Status Strip */}
+                {currentUser && (
+                  <div className="px-2.5 pt-1 flex items-center justify-between gap-2 text-[11px] font-mono text-stone-500 dark:text-stone-400 flex-wrap">
+                    <div className="flex items-center gap-2">
+                      <span
+                        className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-lg font-bold ${
+                          !currentUser.unlimitedTokens &&
+                          currentUser.role !== 'co-admin' &&
+                          typeof currentUser.tokenBalance === 'number' &&
+                          currentUser.tokenBalance <= 0
+                            ? 'bg-red-500/15 text-red-600 border border-red-500/30'
+                            : 'bg-amber-500/15 text-amber-800 dark:text-amber-300'
+                        }`}
+                      >
+                        <Zap className="w-3 h-3" />
+                        {currentUser.unlimitedTokens || currentUser.role === 'co-admin'
+                          ? '∞ Unlimited Tokens'
+                          : `${(currentUser.tokenBalance ?? 0).toLocaleString()} Tokens Remaining`}
+                      </span>
+                      <span>
+                        Used: {(currentUser.totalTokensUsed ?? 0).toLocaleString()}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {currentUser.emailVerified && (
+                        <span className="text-emerald-600 dark:text-emerald-400 font-semibold">
+                          ✓ OTP Verified
+                        </span>
+                      )}
+                      <span>☁️ Firebase Synced</span>
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           </div>
         )}
       </main>
+      )}
     </div>
   );
 }

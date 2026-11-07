@@ -1,0 +1,315 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        request.auth.token.email == 'abhinav2bhai@gmail.com' ||
+        request.auth.token.email == 'abhinavstudents79@gmail.com'
+      );
+    }
+
+    function isValidUserProfile(data) {
+      return data.keys().hasAll([
+        'uid',
+        'name',
+        'role',
+        'tokenBalance',
+        'totalTokensUsed',
+        'unlimitedTokens',
+        'emailVerified',
+        'isBlocked',
+        'violentChatCount',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'uid',
+        'name',
+        'role',
+        'tokenBalance',
+        'totalTokensUsed',
+        'unlimitedTokens',
+        'emailVerified',
+        'isBlocked',
+        'violentChatCount',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      isValidId(data.uid) &&
+      data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
+      (data.role == 'user' || data.role == 'co-admin') &&
+      data.tokenBalance is int && data.tokenBalance >= 0 && data.tokenBalance <= 100000000 &&
+      data.totalTokensUsed is int && data.totalTokensUsed >= 0 && data.totalTokensUsed <= 100000000 &&
+      data.unlimitedTokens is bool &&
+      data.emailVerified is bool &&
+      data.isBlocked is bool &&
+      data.violentChatCount is int && data.violentChatCount >= 0 && data.violentChatCount <= 1000 &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidUserPrivateInfo(data) {
+      return data.keys().hasAll(['uid', 'email', 'ipAddress', 'createdAt', 'updatedAt']) &&
+      data.keys().hasOnly(['uid', 'email', 'ipAddress', 'createdAt', 'updatedAt']) &&
+      isValidId(data.uid) &&
+      data.email is string && data.email.size() >= 3 && data.email.size() <= 180 &&
+      data.ipAddress is string && data.ipAddress.size() >= 3 && data.ipAddress.size() <= 64 &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidChatSessionDoc(data) {
+      return data.keys().hasAll([
+        'uid',
+        'userName',
+        'title',
+        'messagesSummary',
+        'messageCount',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'uid',
+        'userName',
+        'title',
+        'messagesSummary',
+        'messageCount',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      isValidId(data.uid) &&
+      data.userName is string && data.userName.size() >= 1 && data.userName.size() <= 120 &&
+      data.title is string && data.title.size() >= 1 && data.title.size() <= 200 &&
+      data.messagesSummary is string && data.messagesSummary.size() >= 0 && data.messagesSummary.size() <= 20000 &&
+      data.messageCount is int && data.messageCount >= 0 && data.messageCount <= 5000 &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidSiteConfigDoc(data) {
+      return data.keys().hasAll([
+        'authorId',
+        'siteTitle',
+        'metaDescription',
+        'keywords',
+        'universalBanner',
+        'festivalName',
+        'defaultUserTokens',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'authorId',
+        'siteTitle',
+        'metaDescription',
+        'keywords',
+        'universalBanner',
+        'festivalName',
+        'defaultUserTokens',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      isValidId(data.authorId) &&
+      data.siteTitle is string && data.siteTitle.size() >= 1 && data.siteTitle.size() <= 200 &&
+      data.metaDescription is string && data.metaDescription.size() >= 1 && data.metaDescription.size() <= 400 &&
+      data.keywords is string && data.keywords.size() >= 1 && data.keywords.size() <= 400 &&
+      data.universalBanner is string && data.universalBanner.size() >= 0 && data.universalBanner.size() <= 500 &&
+      data.festivalName is string && data.festivalName.size() >= 1 && data.festivalName.size() <= 120 &&
+      data.defaultUserTokens is int && data.defaultUserTokens >= 100 && data.defaultUserTokens <= 10000000 &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    match /admins/{adminId} {
+      allow get: if isSignedIn() && isValidId(adminId) && request.auth.uid == adminId;
+      allow list, create, update, delete: if false;
+    }
+
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (request.auth.uid == userId || isAdmin());
+      allow list: if isSignedIn() && (resource.data.uid == request.auth.uid || isAdmin());
+
+      allow create: if isSignedIn() &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming()) &&
+        incoming().uid == request.auth.uid &&
+        userId == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (
+          (incoming().role == 'user' && incoming().unlimitedTokens == false && incoming().isBlocked == false && incoming().tokenBalance <= 5000) ||
+          isAdmin()
+        );
+
+      allow update: if isSignedIn() &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming()) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          (
+            request.auth.uid == userId &&
+            existing().isBlocked == false &&
+            incoming().role == existing().role &&
+            incoming().unlimitedTokens == existing().unlimitedTokens &&
+            incoming().tokenBalance <= existing().tokenBalance &&
+            incoming().totalTokensUsed >= existing().totalTokensUsed &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'name',
+              'tokenBalance',
+              'totalTokensUsed',
+              'emailVerified',
+              'violentChatCount',
+              'isBlocked',
+              'updatedAt'
+            ])
+          ) ||
+          isAdmin()
+        );
+
+      allow delete: if isAdmin() && isValidId(userId);
+
+      match /private/{docId} {
+        allow get: if isSignedIn() &&
+          isValidId(userId) &&
+          isValidId(docId) &&
+          (request.auth.uid == userId || isAdmin()) &&
+          exists(/databases/$(database)/documents/users/$(userId));
+
+        allow list: if isSignedIn() &&
+          (resource.data.uid == request.auth.uid || isAdmin());
+
+        allow create: if isSignedIn() &&
+          isValidId(userId) &&
+          isValidId(docId) &&
+          docId == 'info' &&
+          isValidUserPrivateInfo(incoming()) &&
+          incoming().uid == request.auth.uid &&
+          userId == request.auth.uid &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          exists(/databases/$(database)/documents/users/$(userId));
+
+        allow update: if isSignedIn() &&
+          isValidId(userId) &&
+          isValidId(docId) &&
+          isValidUserPrivateInfo(incoming()) &&
+          incoming().uid == existing().uid &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          exists(/databases/$(database)/documents/users/$(userId)) &&
+          (
+            (
+              request.auth.uid == userId &&
+              incoming().diff(existing()).affectedKeys().hasOnly(['email', 'ipAddress', 'updatedAt'])
+            ) ||
+            isAdmin()
+          );
+
+        allow delete: if isAdmin() && isValidId(userId) && isValidId(docId);
+      }
+
+      match /chats/{chatId} {
+        allow get: if isSignedIn() &&
+          isValidId(userId) &&
+          isValidId(chatId) &&
+          (request.auth.uid == userId || isAdmin()) &&
+          exists(/databases/$(database)/documents/users/$(userId));
+
+        allow list: if isSignedIn() &&
+          (resource.data.uid == request.auth.uid || isAdmin());
+
+        allow create: if isSignedIn() &&
+          isValidId(userId) &&
+          isValidId(chatId) &&
+          isValidChatSessionDoc(incoming()) &&
+          incoming().uid == request.auth.uid &&
+          userId == request.auth.uid &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          exists(/databases/$(database)/documents/users/$(userId)) &&
+          get(/databases/$(database)/documents/users/$(userId)).data.isBlocked == false;
+
+        allow update: if isSignedIn() &&
+          isValidId(userId) &&
+          isValidId(chatId) &&
+          isValidChatSessionDoc(incoming()) &&
+          incoming().uid == existing().uid &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          exists(/databases/$(database)/documents/users/$(userId)) &&
+          (
+            (
+              request.auth.uid == userId &&
+              get(/databases/$(database)/documents/users/$(userId)).data.isBlocked == false &&
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'userName',
+                'title',
+                'messagesSummary',
+                'messageCount',
+                'updatedAt'
+              ])
+            ) ||
+            isAdmin()
+          );
+
+        allow delete: if isSignedIn() &&
+          isValidId(userId) &&
+          isValidId(chatId) &&
+          (request.auth.uid == userId || isAdmin());
+      }
+    }
+
+    match /site_config/{configId} {
+      allow get: if isValidId(configId);
+      allow list: if false;
+
+      allow create: if isAdmin() &&
+        isValidId(configId) &&
+        isValidSiteConfigDoc(incoming()) &&
+        incoming().authorId == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isAdmin() &&
+        isValidId(configId) &&
+        isValidSiteConfigDoc(incoming()) &&
+        incoming().authorId == existing().authorId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'siteTitle',
+          'metaDescription',
+          'keywords',
+          'universalBanner',
+          'festivalName',
+          'defaultUserTokens',
+          'updatedAt'
+        ]);
+
+      allow delete: if false;
+    }
+  }
+}
