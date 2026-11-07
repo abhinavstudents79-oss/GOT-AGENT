@@ -3,6 +3,21 @@
   publish = "dist"
 
 [[redirects]]
+  from = "/google56a13521b994abc0.html"
+  to = "/google56a13521b994abc0.html"
+  status = 200
+
+[[redirects]]
+  from = "/robots.txt"
+  to = "/robots.txt"
+  status = 200
+
+[[redirects]]
+  from = "/sitemap.xml"
+  to = "/sitemap.xml"
+  status = 200
+
+[[redirects]]
   from = "/GOTadmin"
   to = "/index.html"
   status = 200
@@ -26,3 +41,4 @@
   from = "/*"
   to = "/index.html"
   status = 200
+

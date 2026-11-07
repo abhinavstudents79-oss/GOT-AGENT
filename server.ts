@@ -1288,6 +1288,13 @@ async function startServer() {
     next();
   });
 
+  // Google Search Console HTML Verification File
+  app.get('/google56a13521b994abc0.html', (_req, res) => {
+    res
+      .type('text/html')
+      .send('google-site-verification: google56a13521b994abc0.html');
+  });
+
   // Google SEO Dynamic robots.txt and sitemap.xml
   app.get('/robots.txt', (_req, res) => {
     res
