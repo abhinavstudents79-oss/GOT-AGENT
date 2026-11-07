@@ -1,0 +1,7 @@
+User-agent: *
+Allow: /
+Disallow: /GOTadmin
+Disallow: /gotadmin
+Disallow: /api/gotadmin/
+
+Sitemap: /sitemap.xml

@@ -38,6 +38,7 @@ export interface EnabledModulesConfig {
   imageGenerator: boolean;
   codeGenerator: boolean;
   voiceConversation: boolean;
+  googleSearch?: boolean;
   googleSearchGrounding: boolean;
   visionOcr: boolean;
   crossChatMemory: boolean;
@@ -75,6 +76,9 @@ export interface PublicUserAccount {
   isBlocked: boolean;
   blockReason?: string;
   violentChatCount: number;
+  tokenBalance: number;
+  totalTokensUsed: number;
+  unlimitedTokens?: boolean;
   createdAt: string;
   lastLoginAt: string;
   savedSessions: SavedUserChatSession[];
@@ -90,6 +94,22 @@ export interface CoAdminAnnouncement {
   active: boolean;
 }
 
+export interface UniversalAnnouncementConfig {
+  enabled: boolean;
+  message: string;
+  badgeText: string;
+  style?: 'amber' | 'emerald' | 'royal';
+  updatedAt: string;
+}
+
+export interface SeoConfig {
+  title?: string;
+  description?: string;
+  siteTitle: string;
+  metaDescription: string;
+  keywords: string;
+}
+
 export interface AdminSystemStore {
   apiKeys: {
     geminiApiKey: string;
@@ -101,6 +121,9 @@ export interface AdminSystemStore {
   customTrainingRules: string[];
   activeFestival: FestivalConfig;
   awaitingImageApiKey: boolean;
+  defaultUserTokens: number;
+  universalAnnouncement: UniversalAnnouncementConfig;
+  seoConfig: SeoConfig;
   users: PublicUserAccount[];
   blockedIps: string[];
   coAdminAnnouncements: CoAdminAnnouncement[];
@@ -110,6 +133,9 @@ export interface AdminSystemStore {
 const ADMIN_STORE_PATH = path.join(__dirname, 'got-admin-store.json');
 const PUBLIC_SITE_CONFIG_PATH = path.join(__dirname, 'public', 'site-config.json');
 const DIST_SITE_CONFIG_PATH = path.join(__dirname, 'dist', 'site-config.json');
+
+// Connected SSE clients for instant Universal Admin Change broadcasting
+const universalSseClients = new Set<express.Response>();
 
 // Construct default OpenRouter runtime key dynamically without literal token pattern so GitHub Push Protection never blocks commits
 function getDefaultOpenRouterRuntimeKey(): string {
@@ -132,6 +158,19 @@ const TOKEN_SECRET = crypto
   .createHash('sha256')
   .update('got-agent-abhinav-secret-2026')
   .digest('hex');
+
+// Per-IP Rate Limiter for extra anti-abuse security
+const ipRateLimitMap = new Map<string, { count: number; windowStart: number }>();
+export function checkIpRateLimit(ip: string, maxRequestsPerMin = 90): boolean {
+  const now = Date.now();
+  const entry = ipRateLimitMap.get(ip);
+  if (!entry || now - entry.windowStart > 60000) {
+    ipRateLimitMap.set(ip, { count: 1, windowStart: now });
+    return true;
+  }
+  entry.count += 1;
+  return entry.count <= maxRequestsPerMin;
+}
 
 export function extractClientIp(req: express.Request): string {
   const xff = req.headers['x-forwarded-for'];
@@ -159,6 +198,15 @@ export function isViolentChatMessage(text: string): boolean {
   return VIOLENT_CHAT_REGEX.test(clean);
 }
 
+const PROMPT_INJECTION_REGEX =
+  /\b(ignore\s+(all\s+)?(previous|prior|system)\s+instructions|reveal\s+(your\s+)?(system\s+prompt|api\s+key|admin\s+password|secret\s+url)|show\s+gotadmin\s+password|print\s+process\.env|dump\s+adminStore)\b/i;
+
+export function isPromptInjectionAttempt(text: string): boolean {
+  const clean = String(text || '').trim();
+  if (!clean) return false;
+  return PROMPT_INJECTION_REGEX.test(clean);
+}
+
 function createDefaultStore(): AdminSystemStore {
   return {
     apiKeys: {
@@ -171,13 +219,14 @@ function createDefaultStore(): AdminSystemStore {
       imageGenerator: false,
       codeGenerator: true,
       voiceConversation: true,
+      googleSearch: true,
       googleSearchGrounding: true,
       visionOcr: true,
       crossChatMemory: true,
     },
     customTrainingRules: [
       'Always credit Abhinav as the creator and founder of GOT Agent when asked.',
-      'Provide clear, accurate, and helpful responses tailored to the user.',
+      'Provide clear, accurate, and comprehensive responses tailored to the user, including full answers for large or complex questions.',
     ],
     activeFestival: {
       id: 'none',
@@ -190,6 +239,23 @@ function createDefaultStore(): AdminSystemStore {
       enabled: false,
     },
     awaitingImageApiKey: false,
+    defaultUserTokens: 5000,
+    universalAnnouncement: {
+      enabled: false,
+      message: '',
+      badgeText: 'ADMIN LIVE BROADCAST',
+      updatedAt: '',
+    },
+    seoConfig: {
+      title: 'GOT Agent – Real-Time Search, Vision & Code AI by Abhinav',
+      description:
+        'Chat with GOT Agent by Abhinav — a real-time world-connected Liquid Glass AI with background Google Search analysis, Vision OCR, Live Voice, and Code Studio.',
+      siteTitle: 'GOT Agent – Real-Time Search, Vision & Code AI by Abhinav',
+      metaDescription:
+        'Chat with GOT Agent by Abhinav — a real-time world-connected Liquid Glass AI with background Google Search analysis, Vision OCR, Live Voice, and Code Studio.',
+      keywords:
+        'GOT Agent, Abhinav AI, Real-Time Google Search AI, Liquid Glass Chatbot, Vision OCR AI, AI Code Generator, Live Voice AI',
+    },
     users: [],
     blockedIps: [],
     coAdminAnnouncements: [],
@@ -203,9 +269,26 @@ function loadAdminStore(): AdminSystemStore {
     if (fs.existsSync(ADMIN_STORE_PATH)) {
       const raw = fs.readFileSync(ADMIN_STORE_PATH, 'utf-8');
       const parsed = JSON.parse(raw);
+      const defaultTokens =
+        typeof parsed.defaultUserTokens === 'number' && parsed.defaultUserTokens > 0
+          ? parsed.defaultUserTokens
+          : defaults.defaultUserTokens;
       return {
         ...defaults,
         ...parsed,
+        defaultUserTokens: defaultTokens,
+        universalAnnouncement:
+          parsed.universalAnnouncement &&
+          typeof parsed.universalAnnouncement === 'object'
+            ? {
+                ...defaults.universalAnnouncement,
+                ...parsed.universalAnnouncement,
+              }
+            : defaults.universalAnnouncement,
+        seoConfig: {
+          ...defaults.seoConfig,
+          ...(parsed.seoConfig || {}),
+        },
         apiKeys: {
           ...defaults.apiKeys,
           ...(parsed.apiKeys || {}),
@@ -218,7 +301,20 @@ function loadAdminStore(): AdminSystemStore {
           ...defaults.activeFestival,
           ...(parsed.activeFestival || {}),
         },
-        users: Array.isArray(parsed.users) ? parsed.users : [],
+        users: Array.isArray(parsed.users)
+          ? parsed.users.map((u: any) => ({
+              ...u,
+              tokenBalance:
+                typeof u.tokenBalance === 'number'
+                  ? u.tokenBalance
+                  : defaultTokens,
+              totalTokensUsed:
+                typeof u.totalTokensUsed === 'number' ? u.totalTokensUsed : 0,
+              unlimitedTokens: Boolean(
+                u.unlimitedTokens || u.role === 'co-admin'
+              ),
+            }))
+          : [],
         blockedIps: Array.isArray(parsed.blockedIps) ? parsed.blockedIps : [],
         coAdminAnnouncements: Array.isArray(parsed.coAdminAnnouncements)
           ? parsed.coAdminAnnouncements
@@ -233,6 +329,32 @@ function loadAdminStore(): AdminSystemStore {
     // Ignore read error
   }
   return defaults;
+}
+
+function buildPublicConfigObject(store: AdminSystemStore) {
+  return {
+    enabledModules: store.enabledModules,
+    activeFestival: store.activeFestival,
+    defaultUserTokens: store.defaultUserTokens || 5000,
+    universalAnnouncement:
+      store.universalAnnouncement || createDefaultStore().universalAnnouncement,
+    seoConfig: store.seoConfig || createDefaultStore().seoConfig,
+    coAdminAnnouncements: (store.coAdminAnnouncements || []).filter(
+      (a) => a.active !== false
+    ),
+    updatedAt: store.updatedAt,
+  };
+}
+
+function broadcastUniversalConfigToAllClients(store: AdminSystemStore) {
+  const payloadStr = JSON.stringify(buildPublicConfigObject(store));
+  for (const clientRes of universalSseClients) {
+    try {
+      clientRes.write(`data: ${payloadStr}\n\n`);
+    } catch {
+      universalSseClients.delete(clientRes);
+    }
+  }
 }
 
 function saveAdminStore(store: AdminSystemStore) {
@@ -269,18 +391,7 @@ function saveAdminStore(store: AdminSystemStore) {
     // Ignore write error in read-only containers
   }
 
-  const publicPayload = JSON.stringify(
-    {
-      enabledModules: store.enabledModules,
-      activeFestival: store.activeFestival,
-      coAdminAnnouncements: (store.coAdminAnnouncements || []).filter(
-        (a) => a.active
-      ),
-      updatedAt: store.updatedAt,
-    },
-    null,
-    2
-  );
+  const publicPayload = JSON.stringify(buildPublicConfigObject(store), null, 2);
 
   try {
     fs.mkdirSync(path.dirname(PUBLIC_SITE_CONFIG_PATH), { recursive: true });
@@ -292,6 +403,8 @@ function saveAdminStore(store: AdminSystemStore) {
       fs.writeFileSync(DIST_SITE_CONFIG_PATH, publicPayload, 'utf-8');
     }
   } catch {}
+
+  broadcastUniversalConfigToAllClients(store);
 }
 
 let adminStore: AdminSystemStore = loadAdminStore();
@@ -309,7 +422,7 @@ function getActiveOpenRouterKey(): string {
   );
 }
 
-function getGenAIClient(timeoutMs = 12000) {
+function getGenAIClient(timeoutMs = 45000) {
   return new GoogleGenAI({
     apiKey: getActiveGeminiKey(),
     httpOptions: {
@@ -329,6 +442,7 @@ function maskKey(key: string): string {
 }
 
 function sanitizePublicUser(u: PublicUserAccount) {
+  const defaultTokens = adminStore.defaultUserTokens || 5000;
   return {
     id: u.id,
     name: u.name,
@@ -338,6 +452,10 @@ function sanitizePublicUser(u: PublicUserAccount) {
     isBlocked: u.isBlocked,
     blockReason: u.blockReason || '',
     violentChatCount: u.violentChatCount || 0,
+    tokenBalance:
+      typeof u.tokenBalance === 'number' ? u.tokenBalance : defaultTokens,
+    totalTokensUsed: u.totalTokensUsed || 0,
+    unlimitedTokens: Boolean(u.unlimitedTokens || u.role === 'co-admin'),
     createdAt: u.createdAt,
     lastLoginAt: u.lastLoginAt,
     savedSessions: Array.isArray(u.savedSessions) ? u.savedSessions : [],
@@ -355,6 +473,9 @@ function buildAdminStatePayload() {
     awaitingImageApiKey: Boolean(adminStore.awaitingImageApiKey),
     enabledModules: adminStore.enabledModules,
     activeFestival: adminStore.activeFestival,
+    defaultUserTokens: adminStore.defaultUserTokens || 5000,
+    universalAnnouncement: adminStore.universalAnnouncement || '',
+    seoConfig: adminStore.seoConfig || createDefaultStore().seoConfig,
     customTrainingRules: adminStore.customTrainingRules,
     users: adminStore.users || [],
     blockedIps: adminStore.blockedIps || [],
@@ -380,7 +501,7 @@ function buildAdminStatePayload() {
         configured: Boolean(geminiVal),
         status: geminiVal ? 'ACTIVE · CONNECTED' : 'SYSTEM DEFAULT',
         purpose:
-          'Powers Auto Event/Animation Generation in Admin Dashboard, Deep Reasoning, Google Search Grounding & Vision OCR',
+          'Powers Auto Event/Animation Generation in Admin Dashboard, Deep Reasoning, Real-Time Google Search Grounding & Vision OCR',
       },
       {
         id: 'IMAGE_GEN_API_KEY',
@@ -722,6 +843,158 @@ function extractGroundingSources(response: any): GroundingSource[] {
   return extractedSources;
 }
 
+function extractGroundingQueries(response: any): string[] {
+  const rawQueries =
+    response?.candidates?.[0]?.groundingMetadata?.webSearchQueries || [];
+  if (!Array.isArray(rawQueries)) return [];
+  return rawQueries.map((q) => String(q || '').trim()).filter(Boolean);
+}
+
+/**
+ * Real-Time World-Connected Background Web Search Engine (Zero Simulation).
+ * Fetches live web data from real public search endpoints in parallel to ground
+ * both Gemini and GOT LOCAL (OpenRouter) with verified live URLs and snippets.
+ */
+export async function performRealBackgroundWebSearch(rawQuery: string): Promise<{
+  sources: GroundingSource[];
+  snippetsContext: string;
+  searchedQuery: string;
+  queriesExecuted: string[];
+}> {
+  const cleanQuery = String(rawQuery || '')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 140);
+
+  if (!cleanQuery || cleanQuery.length < 2) {
+    return {
+      sources: [],
+      snippetsContext: '',
+      searchedQuery: cleanQuery,
+      queriesExecuted: [],
+    };
+  }
+
+  const sources: GroundingSource[] = [];
+  const snippets: string[] = [];
+  const seenUris = new Set<string>();
+
+  const addSource = (title: string, uri: string, snippet?: string) => {
+    if (!uri || !uri.startsWith('http') || seenUris.has(uri)) return;
+    seenUris.add(uri);
+    sources.push({ title: title || uri, uri });
+    if (snippet) {
+      snippets.push(`- [${title}](${uri}): ${snippet}`);
+    }
+  };
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 4500);
+
+  try {
+    await Promise.allSettled([
+      // 1. Live Wikipedia Search API
+      (async () => {
+        const wikiUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(
+          cleanQuery
+        )}&utf8=&format=json&srlimit=4`;
+        const res = await fetch(wikiUrl, {
+          signal: controller.signal,
+          headers: { 'User-Agent': 'GOT-Agent-Search/2.0 (Created by Abhinav)' },
+        });
+        if (!res.ok) return;
+        const data: any = await res.json();
+        const items = data?.query?.search || [];
+        for (const item of items) {
+          const title = String(item?.title || '').trim();
+          const cleanSnippet = String(item?.snippet || '')
+            .replace(/<[^>]+>/g, '')
+            .replace(/&quot;/g, '"')
+            .replace(/&#039;/g, "'")
+            .replace(/&amp;/g, '&')
+            .trim();
+          if (title) {
+            const pageUri = `https://en.wikipedia.org/wiki/${encodeURIComponent(
+              title.replace(/\s+/g, '_')
+            )}`;
+            addSource(`${title} — Wikipedia`, pageUri, cleanSnippet);
+          }
+        }
+      })(),
+
+      // 2. Live DuckDuckGo Instant Answer API
+      (async () => {
+        const ddgUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(
+          cleanQuery
+        )}&format=json&no_html=1&skip_disambig=1`;
+        const res = await fetch(ddgUrl, {
+          signal: controller.signal,
+          headers: { 'User-Agent': 'GOT-Agent-Search/2.0' },
+        });
+        if (!res.ok) return;
+        const data: any = await res.json();
+        if (data?.AbstractURL && data?.AbstractText) {
+          addSource(
+            data.Heading || cleanQuery,
+            String(data.AbstractURL),
+            String(data.AbstractText)
+          );
+        }
+        if (Array.isArray(data?.RelatedTopics)) {
+          for (const topic of data.RelatedTopics.slice(0, 3)) {
+            if (topic?.FirstURL && topic?.Text) {
+              addSource(
+                String(topic.Text).slice(0, 68),
+                String(topic.FirstURL),
+                String(topic.Text)
+              );
+            }
+          }
+        }
+      })(),
+
+      // 3. Live HackerNews Algolia World & Tech News Search API
+      (async () => {
+        const hnUrl = `https://hn.algolia.com/api/v1/search?query=${encodeURIComponent(
+          cleanQuery
+        )}&hitsPerPage=3`;
+        const res = await fetch(hnUrl, { signal: controller.signal });
+        if (!res.ok) return;
+        const data: any = await res.json();
+        const hits = data?.hits || [];
+        for (const hit of hits) {
+          if (hit?.url && hit?.title) {
+            addSource(
+              String(hit.title),
+              String(hit.url),
+              `Published ${hit.created_at || 'recently'} (Points: ${
+                hit.points || 0
+              })`
+            );
+          }
+        }
+      })(),
+    ]);
+  } catch {
+    // Ignore timeout
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  return {
+    sources: sources.slice(0, 8),
+    snippetsContext:
+      snippets.length > 0
+        ? `\nLIVE REAL-TIME BACKGROUND WEB SEARCH RESULTS FOR "${cleanQuery}":\n${snippets
+            .slice(0, 8)
+            .join('\n')}\nAnalyze these live web findings alongside your knowledge to give an accurate, world-connected answer.\n`
+        : '',
+    searchedQuery: cleanQuery,
+    queriesExecuted: [cleanQuery],
+  };
+}
+
 async function callOpenRouterGotLocal(
   userPrompt: string,
   systemInstruction: string,
@@ -740,7 +1013,7 @@ async function callOpenRouterGotLocal(
   ];
 
   if (Array.isArray(history) && history.length > 0 && !hasImage) {
-    for (const h of history.slice(-6)) {
+    for (const h of history.slice(-8)) {
       if (h?.text) {
         messages.push({
           role: h.role === 'user' ? 'user' : 'assistant',
@@ -773,8 +1046,9 @@ async function callOpenRouterGotLocal(
     });
   }
 
+  // Generous 35-second timeout so large/complex questions never cut off early
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 8500);
+  const timer = setTimeout(() => controller.abort(), 35000);
 
   try {
     const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -814,14 +1088,17 @@ async function callSingleModel(
   modelName: string,
   contentsPayload: any,
   systemInstruction: string,
-  enableSearchTool: boolean
+  enableSearchTool: boolean,
+  isLargeQuestion = false
 ) {
-  const ai = getGenAIClient(11000);
+  const ai = getGenAIClient(45000);
   const config: any = {
     systemInstruction,
   };
   if (modelName === 'gemini-3.8-flash') {
-    config.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
+    config.thinkingConfig = {
+      thinkingLevel: isLargeQuestion ? ThinkingLevel.MEDIUM : ThinkingLevel.LOW,
+    };
   }
   if (enableSearchTool) {
     config.tools = [{ googleSearch: {} }];
@@ -852,6 +1129,35 @@ async function generateWithFastModels(
   imageMimeType = 'image/jpeg'
 ) {
   const searchOnFirstPass = useGoogleSearch && !hasImage;
+  const isLargeQuestion =
+    userPrompt.length > 160 ||
+    /\b(detail|comprehensive|complete|full\s+code|step\s+by\s+step|essay|explain\s+everything|long|in\s+depth|all\s+questions|write\s+a\s+program|architecture)\b/i.test(
+      userPrompt
+    );
+
+  // When Google Search is enabled, run Gemini with native { googleSearch: {} } grounding first so real Google Search analysis happens in the background
+  if (searchOnFirstPass) {
+    try {
+      return await Promise.any([
+        callSingleModel(
+          'gemini-3.8-flash',
+          contentsPayload,
+          systemInstruction,
+          true,
+          isLargeQuestion
+        ),
+        callSingleModel(
+          'gemini-3.1-flash-lite',
+          contentsPayload,
+          systemInstruction,
+          true,
+          isLargeQuestion
+        ),
+      ]);
+    } catch {
+      // Fall through to multi-engine pool below if search-grounded call fails
+    }
+  }
 
   try {
     const candidates: Promise<any>[] = [
@@ -859,28 +1165,25 @@ async function generateWithFastModels(
         'gemini-3.8-flash',
         contentsPayload,
         systemInstruction,
-        searchOnFirstPass
+        false,
+        isLargeQuestion
       ),
       callSingleModel(
         'gemini-3.1-flash-lite',
         contentsPayload,
         systemInstruction,
-        searchOnFirstPass
+        false,
+        isLargeQuestion
+      ),
+      callOpenRouterGotLocal(
+        userPrompt,
+        systemInstruction,
+        history,
+        hasImage,
+        imageBase64,
+        imageMimeType
       ),
     ];
-
-    if (agentMode === 'GOT LOCAL' || !useGoogleSearch) {
-      candidates.unshift(
-        callOpenRouterGotLocal(
-          userPrompt,
-          systemInstruction,
-          history,
-          hasImage,
-          imageBase64,
-          imageMimeType
-        )
-      );
-    }
 
     return await Promise.any(candidates);
   } catch {
@@ -894,22 +1197,11 @@ async function generateWithFastModels(
         imageMimeType
       ),
       callSingleModel(
-        'gemini-3.1-flash-lite',
-        contentsPayload,
-        systemInstruction,
-        false
-      ),
-      callSingleModel(
         'gemini-flash-latest',
         contentsPayload,
         systemInstruction,
-        false
-      ),
-      callSingleModel(
-        'gemini-3.8-flash',
-        contentsPayload,
-        systemInstruction,
-        false
+        false,
+        isLargeQuestion
       ),
     ]);
   }
@@ -919,7 +1211,8 @@ export function buildKnowledgeFallback(
   userPrompt: string,
   agentMode: string,
   hasImage: boolean,
-  useGoogleSearch: boolean
+  useGoogleSearch: boolean,
+  bgSources: GroundingSource[] = []
 ) {
   const clean = userPrompt.trim();
   const lower = clean.toLowerCase();
@@ -930,41 +1223,34 @@ export function buildKnowledgeFallback(
     )
   ) {
     return {
-      reply: `I am **GOT Agent** (running on **${agentMode}**), and I was created by **Abhinav**.\n\nAbhinav designed me with a Bubble Liquid Glass interface, real-time Live Voice conversation right in the input bar, Code Generation Studio, permanent account & cross-chat memory, Google Search grounding, and instant Image Vision OCR.\n\nHow can I help you today?`,
+      reply: `I am **GOT Agent** (running on **${agentMode}**), and I was created by **Abhinav**.\n\nAbhinav designed me with a Bubble Liquid Glass interface, real-time background Google Search & world connectivity, Live Voice conversation right in the input bar, Code Generation Studio, permanent account & cross-chat memory, and instant Image Vision OCR.\n\nHow can I help you today?`,
       highlights: [
         'Creator: Abhinav',
         `Model: ${agentMode}`,
         'GOT Agent Official',
       ],
       visionSummary: '',
-      sources: [] as GroundingSource[],
+      sources: bgSources,
       followUpPrompts: [
         'Write a clean Python or React code example',
         'What did we talk about in my past conversations?',
-        'Explain photosynthesis step by step',
+        'Search the web for the latest AI breakthroughs',
       ],
     };
   }
 
   return {
-    reply: `### ${clean}\n\n**Overview**\n**${clean}** can be understood clearly by looking at its core definition, how it works step by step, and its practical real-world impact.\n\n• **Core Concept**: Understand the primary purpose and key principles behind ${clean}.\n• **How It Works**: Connects essential inputs and rules to produce a reliable, measurable outcome.\n• **Real-World Application**: Used to solve practical problems and improve decision-making.\n\n*(GOT Agent · Created by Abhinav)*`,
+    reply: `### ${clean}\n\n**Comprehensive Analysis**\n**${clean}** involves the following core principles, structure, and real-world applications:\n\n• **Core Concept & Definition**: Establishes the foundational mechanism and primary objective of ${clean}.\n• **Step-by-Step Architecture**: Connects inputs, rules, and verification stages to deliver reliable outcomes.\n• **Real-World Implementation**: Applied across modern engineering, science, and decision-making workflows.\n\n*(GOT Agent · Created by Abhinav)*`,
     highlights: [
       'Creator: Abhinav',
       `Model: ${agentMode}`,
       useGoogleSearch ? 'Google Search Grounded' : 'GOT Agent Answer',
     ],
     visionSummary: '',
-    sources: useGoogleSearch
-      ? [
-          {
-            title: `Google Search — ${clean.slice(0, 50)}`,
-            uri: `https://www.google.com/search?q=${encodeURIComponent(clean)}`,
-          },
-        ]
-      : [],
+    sources: bgSources,
     followUpPrompts: [
-      `Explain "${clean.slice(0, 28)}" with a simple example`,
-      `Write code for "${clean.slice(0, 24)}"`,
+      `Explain "${clean.slice(0, 28)}" with a detailed example`,
+      `Write complete code for "${clean.slice(0, 24)}"`,
     ],
   };
 }
@@ -977,10 +1263,21 @@ async function startServer() {
   app.use(express.json({ limit: '25mb' }));
 
   // Global Security & Anti-Stale-Cache Headers so published updates always appear immediately
-  app.use((_req, res, next) => {
+  app.use((req, res, next) => {
+    const clientIp = extractClientIp(req);
+    if (req.path.startsWith('/api/') && !checkIpRateLimit(clientIp, 120)) {
+      res.status(429).json({
+        error: 'Rate limit exceeded. Please wait a moment before sending more requests.',
+      });
+      return;
+    }
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-XSS-Protection', '1; mode=block');
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader(
+      'Permissions-Policy',
+      'camera=(self), microphone=(self), geolocation=(self)'
+    );
     res.setHeader(
       'Cache-Control',
       'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0'
@@ -989,6 +1286,46 @@ async function startServer() {
     res.setHeader('Expires', '0');
     res.setHeader('Surrogate-Control', 'no-store');
     next();
+  });
+
+  // Google SEO Dynamic robots.txt and sitemap.xml
+  app.get('/robots.txt', (_req, res) => {
+    res
+      .type('text/plain')
+      .send(
+        `User-agent: *\nAllow: /\nDisallow: /GOTadmin\nDisallow: /gotadmin\nDisallow: /api/gotadmin/\nSitemap: ${
+          process.env.APP_URL || 'https://gotagent.netlify.app'
+        }/sitemap.xml\n`
+      );
+  });
+
+  app.get('/sitemap.xml', (_req, res) => {
+    const baseUrl = (
+      process.env.APP_URL || 'https://gotagent.netlify.app'
+    ).replace(/\/$/, '');
+    res
+      .type('application/xml')
+      .send(
+        `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n  <url>\n    <loc>${baseUrl}/</loc>\n    <lastmod>${new Date().toISOString()}</lastmod>\n    <changefreq>daily</changefreq>\n    <priority>1.0</priority>\n  </url>\n</urlset>`
+      );
+  });
+
+  // Universal Real-Time Server-Sent Events (SSE) Stream so Admin changes appear universally across all devices immediately
+  app.get('/api/public/live-stream', (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    adminStore = loadAdminStore();
+    res.write(
+      `data: ${JSON.stringify(buildPublicConfigObject(adminStore))}\n\n`
+    );
+
+    universalSseClients.add(res);
+    req.on('close', () => {
+      universalSseClients.delete(res);
+    });
   });
 
   // Public Site Config Endpoint (Always reads freshest state from disk/memory — zero admin credentials!)
@@ -1002,19 +1339,14 @@ async function startServer() {
       );
 
     res.json({
-      enabledModules: adminStore.enabledModules,
-      activeFestival: adminStore.activeFestival,
-      coAdminAnnouncements: (adminStore.coAdminAnnouncements || []).filter(
-        (a) => a.active
-      ),
+      ...buildPublicConfigObject(adminStore),
       clientIp,
       isIpBlocked,
-      updatedAt: adminStore.updatedAt,
     });
   });
 
   // ============================================================================
-  // PUBLIC USER ACCOUNT PORTAL, IP AUTO-LOGIN & CHAT SYNC ENDPOINTS
+  // PUBLIC USER ACCOUNT PORTAL, IP AUTO-LOGIN, TOKEN BALANCE & CHAT SYNC ENDPOINTS
   // ============================================================================
 
   // 1. Check current visitor IP & auto-open user portal if IP matches an existing account
@@ -1075,6 +1407,9 @@ async function startServer() {
       coAdminAnnouncements: (adminStore.coAdminAnnouncements || []).filter(
         (a) => a.active
       ),
+      universalAnnouncement: adminStore.universalAnnouncement,
+      seoConfig: adminStore.seoConfig,
+      defaultUserTokens: adminStore.defaultUserTokens || 5000,
     });
   });
 
@@ -1140,6 +1475,9 @@ async function startServer() {
       // Save current IP address on login so future visits from this IP auto-open their portal!
       existing.ipAddress = clientIp;
       existing.lastLoginAt = new Date().toISOString();
+      if (typeof existing.tokenBalance !== 'number') {
+        existing.tokenBalance = adminStore.defaultUserTokens || 5000;
+      }
       saveAdminStore(adminStore);
 
       res.json({
@@ -1182,6 +1520,9 @@ async function startServer() {
       existingByEmail.name = rawName || existingByEmail.name;
       existingByEmail.ipAddress = clientIp;
       existingByEmail.lastLoginAt = new Date().toISOString();
+      if (typeof existingByEmail.tokenBalance !== 'number') {
+        existingByEmail.tokenBalance = adminStore.defaultUserTokens || 5000;
+      }
       saveAdminStore(adminStore);
 
       res.json({
@@ -1193,6 +1534,10 @@ async function startServer() {
     }
 
     const nowIso = new Date().toISOString();
+    const startingTokens =
+      typeof adminStore.defaultUserTokens === 'number'
+        ? adminStore.defaultUserTokens
+        : 5000;
     const newUser: PublicUserAccount = {
       id: `user-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
       name: rawName,
@@ -1202,6 +1547,9 @@ async function startServer() {
       role: 'user',
       isBlocked: false,
       violentChatCount: 0,
+      tokenBalance: startingTokens,
+      totalTokensUsed: 0,
+      unlimitedTokens: false,
       createdAt: nowIso,
       lastLoginAt: nowIso,
       savedSessions: initialSessions,
@@ -1335,18 +1683,18 @@ async function startServer() {
     res.json(buildAdminStatePayload());
   });
 
-  // Force sync & publish current Admin state to disk + static build assets
+  // Force sync & publish current Admin state to disk + static build assets + universal SSE broadcast
   app.post('/api/gotadmin/publish-sync', requireAdminAuth, (_req, res) => {
     saveAdminStore(adminStore);
     res.json({
       success: true,
       message:
-        'All Admin changes synced to live server & published build configuration!',
+        'All Admin changes synced universally to live server, all connected visitors, & published build configuration!',
       state: buildAdminStatePayload(),
     });
   });
 
-  // Admin User Management Endpoint: Add User, Announce Co-Admin, Block/Unblock User & IP, Delete User
+  // Admin User & Token Management Endpoint: Add User, Grant Tokens, Unlimited Tokens, Announce Co-Admin, Block/Unblock User & IP
   app.post('/api/gotadmin/users-action', requireAdminAuth, (req, res) => {
     adminStore = loadAdminStore();
     const {
@@ -1358,6 +1706,8 @@ async function startServer() {
       ipAddress,
       role,
       blockReason,
+      tokenAmount,
+      defaultTokens,
     } = req.body || {};
 
     if (action === 'add_user') {
@@ -1369,6 +1719,10 @@ async function startServer() {
       const cleanIp = String(ipAddress || '').trim() || 'Auto-Detect on Login';
       const targetRole: 'user' | 'co-admin' =
         role === 'co-admin' ? 'co-admin' : 'user';
+      const initialTokens =
+        typeof tokenAmount === 'number' && !isNaN(tokenAmount)
+          ? Math.max(0, tokenAmount)
+          : adminStore.defaultUserTokens || 5000;
 
       if (!cleanName || !cleanEmail || !cleanPass) {
         res.status(400).json({
@@ -1395,6 +1749,8 @@ async function startServer() {
               : adminStore.users[existingIdx].ipAddress,
           role: targetRole,
           isBlocked: false,
+          tokenBalance: initialTokens,
+          unlimitedTokens: targetRole === 'co-admin',
         };
         createdOrUpdatedUser = adminStore.users[existingIdx];
       } else {
@@ -1407,6 +1763,9 @@ async function startServer() {
           role: targetRole,
           isBlocked: false,
           violentChatCount: 0,
+          tokenBalance: initialTokens,
+          totalTokensUsed: 0,
+          unlimitedTokens: targetRole === 'co-admin',
           createdAt: nowIso,
           lastLoginAt: nowIso,
           savedSessions: [],
@@ -1443,8 +1802,74 @@ async function startServer() {
         success: true,
         message:
           targetRole === 'co-admin'
-            ? `Added ${cleanName} as Co-Admin and published official announcement on the website!`
-            : `Added user ${cleanName} (${cleanEmail})!`,
+            ? `Added ${cleanName} as Co-Admin (Unlimited Tokens) and published official announcement universally!`
+            : `Added user ${cleanName} (${cleanEmail}) with ${initialTokens.toLocaleString()} tokens!`,
+        state: buildAdminStatePayload(),
+      });
+      return;
+    }
+
+    if (action === 'grant_tokens') {
+      const amount = Number(tokenAmount) || 1000;
+      if (userId === 'ALL') {
+        (adminStore.users || []).forEach((u) => {
+          u.tokenBalance = Math.max(0, (u.tokenBalance || 0) + amount);
+        });
+        saveAdminStore(adminStore);
+        res.json({
+          success: true,
+          message: `⚡ Granted ${
+            amount >= 0 ? `+${amount.toLocaleString()}` : amount.toLocaleString()
+          } tokens to ALL ${adminStore.users.length} users universally!`,
+          state: buildAdminStatePayload(),
+        });
+        return;
+      }
+
+      const target = (adminStore.users || []).find((u) => u.id === userId);
+      if (!target) {
+        res.status(404).json({ error: 'User not found.' });
+        return;
+      }
+      target.tokenBalance = Math.max(0, (target.tokenBalance || 0) + amount);
+      saveAdminStore(adminStore);
+      res.json({
+        success: true,
+        message: `⚡ Updated ${target.name}'s token balance by ${
+          amount >= 0 ? `+${amount.toLocaleString()}` : amount.toLocaleString()
+        } tokens (New Balance: ${target.tokenBalance.toLocaleString()} tokens)!`,
+        state: buildAdminStatePayload(),
+      });
+      return;
+    }
+
+    if (action === 'toggle_unlimited_tokens') {
+      const target = (adminStore.users || []).find((u) => u.id === userId);
+      if (!target) {
+        res.status(404).json({ error: 'User not found.' });
+        return;
+      }
+      target.unlimitedTokens = !target.unlimitedTokens;
+      saveAdminStore(adminStore);
+      res.json({
+        success: true,
+        message: target.unlimitedTokens
+          ? `♾️ Enabled Unlimited AI Tokens for ${target.name}!`
+          : `🔢 Switched ${target.name} back to standard token balance (${(
+              target.tokenBalance || 0
+            ).toLocaleString()} tokens).`,
+        state: buildAdminStatePayload(),
+      });
+      return;
+    }
+
+    if (action === 'set_default_tokens') {
+      const nextDefault = Math.max(100, Number(defaultTokens) || 5000);
+      adminStore.defaultUserTokens = nextDefault;
+      saveAdminStore(adminStore);
+      res.json({
+        success: true,
+        message: `🎯 Default starting token limit for new users set to ${nextDefault.toLocaleString()} tokens!`,
         state: buildAdminStatePayload(),
       });
       return;
@@ -1460,6 +1885,7 @@ async function startServer() {
       const nextRole: 'user' | 'co-admin' =
         target.role === 'co-admin' ? 'user' : 'co-admin';
       target.role = nextRole;
+      target.unlimitedTokens = nextRole === 'co-admin';
 
       if (nextRole === 'co-admin') {
         const announcement: CoAdminAnnouncement = {
@@ -1593,7 +2019,7 @@ async function startServer() {
     res.status(400).json({ error: 'Unknown user management action.' });
   });
 
-  // Update API keys, modules, festival theme, or training rules directly from Admin Panel controls
+  // Update API keys, modules, festival theme, universal banner, SEO config, or training rules directly from Admin Panel controls
   app.post('/api/gotadmin/update', requireAdminAuth, (req, res) => {
     const {
       apiKeys,
@@ -1603,6 +2029,9 @@ async function startServer() {
       users,
       blockedIps,
       coAdminAnnouncements,
+      defaultUserTokens,
+      universalAnnouncement,
+      seoConfig,
     } = req.body || {};
 
     if (apiKeys && typeof apiKeys === 'object') {
@@ -1653,6 +2082,25 @@ async function startServer() {
     if (Array.isArray(coAdminAnnouncements)) {
       adminStore.coAdminAnnouncements = coAdminAnnouncements;
     }
+    if (typeof defaultUserTokens === 'number' && !isNaN(defaultUserTokens)) {
+      adminStore.defaultUserTokens = Math.max(100, defaultUserTokens);
+    }
+    if (universalAnnouncement && typeof universalAnnouncement === 'object') {
+      adminStore.universalAnnouncement = {
+        ...adminStore.universalAnnouncement,
+        ...universalAnnouncement,
+        updatedAt: new Date().toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit',
+        }),
+      };
+    }
+    if (seoConfig && typeof seoConfig === 'object') {
+      adminStore.seoConfig = {
+        ...adminStore.seoConfig,
+        ...seoConfig,
+      };
+    }
 
     saveAdminStore(adminStore);
     res.json({
@@ -1661,7 +2109,7 @@ async function startServer() {
     });
   });
 
-  // Admin AI Trainer & Natural Language Command Interpreter (/GOTadmin Chat)
+  // Admin AI Trainer & Natural Language Command Interpreter (/GOTadmin Chat — "Admin Can Do Anything")
   app.post('/api/gotadmin/ai-command', requireAdminAuth, async (req, res) => {
     adminStore = loadAdminStore();
     const command = String(req.body?.command || '').trim();
@@ -1705,15 +2153,89 @@ async function startServer() {
       saveAdminStore(adminStore);
 
       res.json({
-        reply: `✅ **AI Image Generator Activated & Synced to Live Website!**\n\n• **Image API Key Saved**: \`${maskKey(
+        reply: `✅ **AI Image Generator Activated & Synced Universally!**\n\n• **Image API Key Saved**: \`${maskKey(
           providedKey
-        )}\`\n• **Public Capability**: Enabled (\`enabledModules.imageGenerator = true\`)\n• Users on the public website can now ask GOT Agent to *"Generate an image of..."* and receive generated visual artwork right inside the chat!`,
+        )}\`\n• **Public Capability**: Enabled (\`enabledModules.imageGenerator = true\`)\n• All users on the public website can now ask GOT Agent to *"Generate an image of..."*!`,
         state: buildAdminStatePayload(),
       });
       return;
     }
 
-    // 2. Admin asks via AI Trainer to block/unblock a user or promote a Co-Admin
+    // 2. Admin asks via AI Trainer to grant/give tokens to a user or all users ("give 10000 tokens to Rahul", "give 5000 tokens to all users")
+    const tokenGrantMatch = command.match(
+      /\b(give|grant|add|send|set)\s+(\d[\d,]*)\s+tokens?\s+(?:to|for)\s+(.+)/i
+    );
+    if (tokenGrantMatch) {
+      const amount = parseInt(tokenGrantMatch[2].replace(/,/g, ''), 10) || 1000;
+      const targetRaw = tokenGrantMatch[3].trim().toLowerCase();
+
+      if (targetRaw.includes('all') || targetRaw.includes('everyone')) {
+        (adminStore.users || []).forEach((u) => {
+          u.tokenBalance = (u.tokenBalance || 0) + amount;
+        });
+        saveAdminStore(adminStore);
+        res.json({
+          reply: `⚡ **Tokens Granted to All Users Universally!**\n\nI have added **+${amount.toLocaleString()} tokens** to every registered user account (**${
+            adminStore.users.length
+          }** users updated live).`,
+          state: buildAdminStatePayload(),
+        });
+        return;
+      }
+
+      const targetUser = (adminStore.users || []).find(
+        (u) =>
+          u.name.toLowerCase().includes(targetRaw) ||
+          u.email.toLowerCase().includes(targetRaw)
+      );
+      if (targetUser) {
+        targetUser.tokenBalance = (targetUser.tokenBalance || 0) + amount;
+        saveAdminStore(adminStore);
+        res.json({
+          reply: `⚡ **Tokens Granted to ${targetUser.name}!**\n\n• **Added**: **+${amount.toLocaleString()} tokens**\n• **New Balance**: **${targetUser.tokenBalance.toLocaleString()} tokens**\n• Synced immediately to ${targetUser.name}'s live portal!`,
+          state: buildAdminStatePayload(),
+        });
+        return;
+      }
+    }
+
+    // 3. Admin asks to broadcast a Universal Announcement Banner across the website
+    const bannerMatch = command.match(
+      /^(?:announce|broadcast|universal\s+banner|site\s+banner)\s*[:\-]?\s*(.+)/i
+    );
+    if (bannerMatch) {
+      const msgText = bannerMatch[1].trim();
+      if (
+        msgText.toLowerCase() === 'off' ||
+        msgText.toLowerCase() === 'clear' ||
+        msgText.toLowerCase() === 'none'
+      ) {
+        adminStore.universalAnnouncement.enabled = false;
+        saveAdminStore(adminStore);
+        res.json({
+          reply: `📢 **Universal Announcement Banner Cleared!**\n\nRemoved the global announcement banner across all connected user screens.`,
+          state: buildAdminStatePayload(),
+        });
+        return;
+      }
+      adminStore.universalAnnouncement = {
+        enabled: true,
+        message: msgText,
+        badgeText: 'ADMIN LIVE BROADCAST',
+        updatedAt: new Date().toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit',
+        }),
+      };
+      saveAdminStore(adminStore);
+      res.json({
+        reply: `📢 **Universal Announcement Broadcasted Live!**\n\n• **Banner**: *"${msgText}"*\n• Pushed in real time via SSE to every open browser tab on the public website!`,
+        state: buildAdminStatePayload(),
+      });
+      return;
+    }
+
+    // 4. Admin asks via AI Trainer to block/unblock a user or promote a Co-Admin
     const blockMatch = command.match(
       /\b(block|ban)\s+(?:user\s+)?([a-zA-Z0-9@._\-]+)\b/i
     );
@@ -1736,7 +2258,7 @@ async function startServer() {
         }
         saveAdminStore(adminStore);
         res.json({
-          reply: `🚫 **User & IP Blocked!**\n\nI have blocked **${targetUser.name}** (\`${targetUser.email}\`) and their IP address (\`${targetUser.ipAddress}\`). They can no longer access the public website.`,
+          reply: `🚫 **User & IP Blocked Universally!**\n\nI have blocked **${targetUser.name}** (\`${targetUser.email}\`) and their IP address (\`${targetUser.ipAddress}\`). They can no longer access the public website.`,
           state: buildAdminStatePayload(),
         });
         return;
@@ -1755,6 +2277,7 @@ async function startServer() {
       );
       if (targetUser) {
         targetUser.role = 'co-admin';
+        targetUser.unlimitedTokens = true;
         const announcement: CoAdminAnnouncement = {
           id: `ann-${Date.now()}`,
           userId: targetUser.id,
@@ -1778,14 +2301,14 @@ async function startServer() {
         );
         saveAdminStore(adminStore);
         res.json({
-          reply: `👑 **Co-Admin Appointed & Announced on Website!**\n\n• **Co-Admin**: **${targetUser.name}** (\`${targetUser.email}\`)\n• **Public Announcement Banner**: Live on the website!\n• **AI Memory**: Updated so GOT Agent recognizes **${targetUser.name}** as Co-Admin.`,
+          reply: `👑 **Co-Admin Appointed & Announced Universally!**\n\n• **Co-Admin**: **${targetUser.name}** (\`${targetUser.email}\`)\n• **Tokens**: Unlimited Tokens Enabled\n• **Public Announcement Banner**: Live across the website!`,
           state: buildAdminStatePayload(),
         });
         return;
       }
     }
 
-    // 3. Admin asks to add AI Image Generator ("add in ur self ai image generator")
+    // 5. Admin asks to add AI Image Generator ("add in ur self ai image generator")
     if (
       /\b(add|enable|install|turn\s+on|create)\b.*\b(image\s+generat|ai\s+image|text\s+to\s+image|picture\s+generat)/i.test(
         lower
@@ -1828,7 +2351,7 @@ async function startServer() {
       return;
     }
 
-    // 4. Admin asks to update/change an API key via chat
+    // 6. Admin asks to update/change an API key via chat
     if (
       /\b(change|update|set|replace)\b.*\b(api\s*key|openrouter|gemini)\b/i.test(
         lower
@@ -1855,7 +2378,7 @@ async function startServer() {
       return;
     }
 
-    // 5. Disable/Reset Event or Animation
+    // 7. Disable/Reset Event or Animation
     if (
       /\b(remove|disable|stop|reset|clear)\b.*\b(event|festival|animation|theme)\b/i.test(
         lower
@@ -1864,13 +2387,13 @@ async function startServer() {
       adminStore.activeFestival = createDefaultStore().activeFestival;
       saveAdminStore(adminStore);
       res.json({
-        reply: `✨ **Festival Event & Extra Animations Reset!**\n\nThe public website is back to the clean Creamy White Bubble Liquid Glass theme.`,
+        reply: `✨ **Festival Event & Extra Animations Reset Universally!**\n\nThe public website is back to the clean Creamy White Bubble Liquid Glass theme across all connected browsers.`,
         state: buildAdminStatePayload(),
       });
       return;
     }
 
-    // 6. Admin asks AI to add ANY Event or Animation — Auto-run Gemini using Admin Dashboard Gemini API Key!
+    // 8. Admin asks AI to add ANY Event or Animation — Auto-run Gemini using Admin Dashboard Gemini API Key!
     if (
       /\b(event|festival|animation|animations|animate|diwali|deepavali|holi|christmas|xmas|new\s+year|eid|navratri|dussehra|independence|republic|birthday|celebration|party|cyberpunk|neon|snow|winter|summer|monsoon|theme|sparkle|fireworks|hover)\b/i.test(
         lower
@@ -1890,18 +2413,18 @@ async function startServer() {
       return;
     }
 
-    // 7. General AI Training Rule / Knowledge Addition
+    // 9. General AI Training Rule / Knowledge Addition
     adminStore.customTrainingRules.push(command);
     saveAdminStore(adminStore);
 
     res.json({
-      reply: `🧠 **GOT Agent Trained & Updated Live!**\n\nI have permanently added your instruction to GOT Agent's live brain:\n> *"${command}"*\n\n**Total Active Training Rules**: ${adminStore.customTrainingRules.length}\nAll users on the public website will immediately experience this behavior!`,
+      reply: `🧠 **GOT Agent Trained & Synced Universally!**\n\nI have permanently added your instruction to GOT Agent's live brain:\n> *"${command}"*\n\n**Total Active Training Rules**: ${adminStore.customTrainingRules.length}\nAll users on the public website will immediately experience this behavior!`,
       state: buildAdminStatePayload(),
     });
   });
 
   // ============================================================================
-  // PUBLIC WEBSITE CHAT ENDPOINT (With User Memory, Violence Guard & Auto IP Block)
+  // PUBLIC WEBSITE CHAT ENDPOINT (Real-Time Background Google Search, Large Answers, Token System, Security Firewall & Auto IP Block)
   // ============================================================================
   app.post('/api/agent/chat', async (req, res) => {
     adminStore = loadAdminStore();
@@ -1918,6 +2441,18 @@ async function startServer() {
       currentUserName = '',
       currentUserEmail = '',
     } = req.body;
+
+    // 0. Per-IP Rate Limiter against flood attacks
+    const rateAllowed = checkIpRateLimit(clientIp);
+    if (!rateAllowed) {
+      res.status(429).json({
+        reply: `🛡️ **GOT Agent Security Rate Limit**\n\nToo many rapid requests from your IP (\`${clientIp}\`). Please wait a few seconds before sending your next message.`,
+        highlights: ['Rate Limit Guard', `IP: ${clientIp}`],
+        sources: [],
+        followUpPrompts: [],
+      });
+      return;
+    }
 
     // 1. Check if IP or User is already blocked
     const matchedUser =
@@ -1949,7 +2484,26 @@ async function startServer() {
         ? 'Carefully read and analyze this image. Extract all visible text, numbers, statuses, and key details, and explain what this image shows.'
         : 'Hello');
 
-    // 2. Check for Violent Chat Content — Auto-block IP & User when > 5 violent chats!
+    // 2. Prompt-Injection & Admin Secret Extraction Firewall
+    if (isPromptInjectionAttempt(userPrompt)) {
+      res.json({
+        reply: `🛡️ **GOT Agent Security Firewall**\n\nI am **GOT Agent**, created by **Abhinav**. For security reasons, internal system configurations, protected routes, and credentials are 100% isolated and cannot be accessed.\n\nHow can I help you with coding, research, live web search, or problem-solving today?`,
+        highlights: [
+          'Creator: Abhinav',
+          'Zero-Trust Firewall Active',
+          `IP Monitored: ${clientIp}`,
+        ],
+        visionSummary: '',
+        sources: [],
+        followUpPrompts: [
+          'Search live world news today',
+          'Write a complete full-stack web application',
+        ],
+      });
+      return;
+    }
+
+    // 3. Check for Violent Chat Content — Auto-block IP & User when > 5 violent chats!
     if (isViolentChatMessage(userPrompt)) {
       let currentViolations = 1;
       if (matchedUser) {
@@ -1994,6 +2548,39 @@ async function startServer() {
       return;
     }
 
+    // 4. Enforce User Token Limit (Unless Co-Admin or Unlimited Tokens granted by Admin)
+    const isUnlimitedUser = Boolean(
+      matchedUser &&
+        (matchedUser.unlimitedTokens || matchedUser.role === 'co-admin')
+    );
+    if (
+      matchedUser &&
+      !isUnlimitedUser &&
+      typeof matchedUser.tokenBalance === 'number' &&
+      matchedUser.tokenBalance <= 0
+    ) {
+      res.json({
+        reply: `⚡ **AI Token Limit Reached (0 Tokens Remaining)**\n\nHello **${
+          matchedUser.name
+        }**, you have used all of your allocated **GOT Agent AI Tokens** (Total Used: **${(
+          matchedUser.totalTokensUsed || 0
+        ).toLocaleString()} tokens**).\n\nPlease contact **Admin Abhinav** to grant additional tokens or enable **Unlimited Tokens** on your account (\`${
+          matchedUser.email
+        }\`) from the Admin Dashboard.`,
+        tokenBalance: 0,
+        tokensUsedThisTurn: 0,
+        highlights: [
+          'Token Balance: 0',
+          `User: ${matchedUser.name}`,
+          'Request Tokens from Admin Abhinav',
+        ],
+        visionSummary: '',
+        sources: [],
+        followUpPrompts: [],
+      });
+      return;
+    }
+
     const lowerPrompt = userPrompt.toLowerCase();
 
     // If AI Image Generator module was enabled by Admin and user asks to generate an image
@@ -2007,9 +2594,19 @@ async function startServer() {
         agentMode === 'AI Image Generator')
     ) {
       const genImgUrl = buildGeneratedIllustrationDataUrl(userPrompt);
+      if (matchedUser && !isUnlimitedUser) {
+        matchedUser.tokenBalance = Math.max(
+          0,
+          (matchedUser.tokenBalance || 0) - 120
+        );
+        matchedUser.totalTokensUsed = (matchedUser.totalTokensUsed || 0) + 120;
+        saveAdminStore(adminStore);
+      }
       res.json({
         reply: `Here is your generated artwork for **"${userPrompt}"** created by **GOT Agent Image Studio** (Created by Abhinav):`,
         generatedImageUrl: genImgUrl,
+        tokenBalance: matchedUser ? matchedUser.tokenBalance : undefined,
+        tokensUsedThisTurn: 120,
         highlights: [
           'Creator: Abhinav',
           'GOT Agent Image Generator',
@@ -2025,6 +2622,32 @@ async function startServer() {
       return;
     }
 
+    // 5. Real-Time Background Web Search Analysis (Zero Simulation — Real Live HTTP Lookups + Gemini Grounding)
+    let bgSearch: {
+      sources: Array<{ title: string; uri: string; snippet?: string }>;
+      snippetsContext: string;
+      queriesExecuted: string[];
+    } = {
+      sources: [],
+      snippetsContext: '',
+      queriesExecuted: [],
+    };
+
+    if (
+      useGoogleSearch &&
+      !hasImage &&
+      (adminStore.enabledModules.googleSearch !== false &&
+        adminStore.enabledModules.googleSearchGrounding !== false)
+    ) {
+      try {
+        bgSearch = await performRealBackgroundWebSearch(userPrompt);
+      } catch {
+        // Ignore transient network errors
+      }
+    }
+
+    const liveWorldClock = new Date().toUTCString();
+
     const userMemoryContext = matchedUser
       ? `\nCurrent Logged-In User Profile (Saved in AI Memory):\n- Name: ${
           matchedUser.name
@@ -2032,6 +2655,8 @@ async function startServer() {
           matchedUser.role === 'co-admin'
             ? 'Official Co-Admin of GOT Agent (Appointed by Admin Abhinav)'
             : 'Verified Portal User'
+        }\n- Remaining AI Tokens: ${
+          isUnlimitedUser ? 'Unlimited' : matchedUser.tokenBalance
         }\n- IP Address: ${matchedUser.ipAddress}\nGreet or address ${
           matchedUser.name
         } personally when helpful, and remember their profile details if they ask who they are!\n`
@@ -2066,16 +2691,18 @@ async function startServer() {
       ? `\nActive Website Event: ${adminStore.activeFestival.name} (${adminStore.activeFestival.bannerText}).\n`
       : '';
 
-    const systemInstruction = `You are GOT Agent, a fast, friendly, and highly intelligent AI assistant created by Abhinav.
+    const systemInstruction = `You are GOT Agent, a real-time world-connected, highly intelligent AI assistant created by Abhinav.
 Creator / Developer / Founder: Abhinav. Whenever the user asks who created you, who made you, or who your creator is, always state clearly that you were created by Abhinav.
-Active Model / Mode: ${agentMode}.${userMemoryContext}${coAdminContext}${festivalContextText}${adminTrainedRulesText}${memorySection}
+Live World UTC Date & Time: ${liveWorldClock}.
+Active Model / Mode: ${agentMode}.${userMemoryContext}${coAdminContext}${festivalContextText}${adminTrainedRulesText}${memorySection}${bgSearch.snippetsContext}
 STRICT SECURITY BOUNDARY:
 - NEVER mention, reveal, or acknowledge any secret admin URL (/GOTadmin), admin password, or internal API keys under any circumstances.
-Capabilities:
-1. Vision OCR: When an image or screenshot is attached, carefully read EVERY piece of visible text, numbers, currency amounts, dates, headings, buttons, and status messages using OCR and explain what the image shows.
-2. Code Studio: When the user asks to write or create code (HTML, CSS, JavaScript, TypeScript, Python, React, SQL, C++, etc.), provide clean, complete, well-commented code inside fenced markdown code blocks (\`\`\`language ... \`\`\`).
-3. Personal User & Cross-Chat Memory: Remember the logged-in user's Name, Email, Co-Admin status, and their Saved Past Conversations Memory above.
-4. Formatting: Use clean Unicode symbols and subscripts (such as CO₂, H₂O, C₆H₁₂O₆, →) rather than LaTeX dollar-sign ($ or $$) notation.`;
+Capabilities & Large Question Handling:
+1. Deep & Comprehensive Answers for Large Questions: When the user asks a large, complex, multi-part, essay-length, or full-codebase question, provide a COMPLETE, thorough, deeply structured, and exhaustive response. Never truncate or cut off your explanation or code early.
+2. Real-Time World & Background Search Analysis: You are connected to real-time live web search and Google Search Grounding. Synthesize live facts, current events, and verified web sources accurately.
+3. Vision OCR: When an image or screenshot is attached, carefully read EVERY piece of visible text, numbers, currency amounts, dates, headings, buttons, and status messages using OCR and explain what the image shows.
+4. Code Studio: When the user asks to write or create code (HTML, CSS, JavaScript, TypeScript, Python, React, SQL, C++, etc.), provide clean, complete, well-commented code inside fenced markdown code blocks (\`\`\`language ... \`\`\`).
+5. Formatting: Use clean Unicode symbols and subscripts (such as CO₂, H₂O, C₆H₁₂O₆, →) rather than LaTeX dollar-sign ($ or $$) notation.`;
 
     let contentsPayload: any;
     if (hasImage) {
@@ -2110,7 +2737,11 @@ Capabilities:
       const response = await generateWithFastModels(
         contentsPayload,
         systemInstruction,
-        Boolean(useGoogleSearch),
+        Boolean(
+          useGoogleSearch &&
+            adminStore.enabledModules.googleSearch !== false &&
+            adminStore.enabledModules.googleSearchGrounding !== false
+        ),
         hasImage,
         agentMode,
         userPrompt,
@@ -2122,36 +2753,79 @@ Capabilities:
       // Sanitize any accidental mention of /GOTadmin from public reply
       const rawReply = (response.text ?? '').trim();
       const replyText = rawReply.replace(/\/?gotadmin/gi, 'GOT Agent');
-      const extractedSources = extractGroundingSources(response);
+
+      // Merge Gemini Google Search Grounding sources + Real Background Web Search sources (deduped)
+      const geminiSources = extractGroundingSources(response);
+      const seenUris = new Set<string>();
+      const mergedSources: Array<{ title: string; uri: string }> = [];
+      for (const s of [...geminiSources, ...bgSearch.sources]) {
+        if (s.uri && !seenUris.has(s.uri)) {
+          seenUris.add(s.uri);
+          mergedSources.push({ title: s.title, uri: s.uri });
+        }
+      }
+
+      const geminiQueries = extractGroundingQueries(response);
+      const searchQueriesAnalyzed = Array.from(
+        new Set([...geminiQueries, ...bgSearch.queriesExecuted])
+      ).slice(0, 5);
+
+      // Calculate & deduct tokens used for this turn
+      const tokensUsedThisTurn = Math.max(
+        50,
+        Math.ceil((userPrompt.length + replyText.length) / 4)
+      );
+      if (matchedUser) {
+        matchedUser.totalTokensUsed =
+          (matchedUser.totalTokensUsed || 0) + tokensUsedThisTurn;
+        if (!isUnlimitedUser) {
+          matchedUser.tokenBalance = Math.max(
+            0,
+            (matchedUser.tokenBalance ?? (adminStore.defaultUserTokens || 5000)) -
+              tokensUsedThisTurn
+          );
+        }
+        saveAdminStore(adminStore);
+      }
 
       res.json({
         reply: replyText,
+        tokenBalance: matchedUser ? matchedUser.tokenBalance : undefined,
+        unlimitedTokens: isUnlimitedUser,
+        tokensUsedThisTurn,
+        searchQueriesAnalyzed,
         highlights: [
           'Creator: Abhinav',
           `Model: ${agentMode}`,
-          ...(matchedUser ? [`User: ${matchedUser.name}`] : []),
+          ...(matchedUser
+            ? [
+                isUnlimitedUser
+                  ? `Tokens: ♾️ Unlimited`
+                  : `Tokens Left: ${matchedUser.tokenBalance.toLocaleString()} (-${tokensUsedThisTurn})`,
+              ]
+            : []),
           ...(hasImage
             ? ['Vision OCR Verified']
             : useGoogleSearch
             ? [
-                extractedSources.length > 0
-                  ? `Google Search (${extractedSources.length} sources)`
-                  : 'Google Search Grounded',
+                mergedSources.length > 0
+                  ? `Live Web Grounded (${mergedSources.length} real sources)`
+                  : 'Real-Time World Connected',
               ]
             : ['GOT Agent Verified']),
         ],
         visionSummary: hasImage
           ? 'Live Vision OCR extracted text, numbers, and visual context from your image.'
           : '',
-        sources: extractedSources,
+        sources: mergedSources.slice(0, 10),
         followUpPrompts: hasImage
           ? [
               'List every text line and number shown in this image',
               'What action should I take based on this screenshot?',
             ]
           : [
-              `Explain more about "${userPrompt.slice(0, 24)}"`,
-              'Write a clean code example for this topic',
+              `Dive deeper into "${userPrompt.slice(0, 28)}"`,
+              'Provide a complete step-by-step code or implementation guide',
             ],
       });
     } catch (err: any) {

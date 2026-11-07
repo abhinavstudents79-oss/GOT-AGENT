@@ -50,6 +50,7 @@ import {
   UserCheck,
   Megaphone,
   MessageSquare,
+  Zap,
 } from 'lucide-react';
 
 import operatorAvatarImg from './assets/images/avatar_executive_operator_1793981937152.jpg';
@@ -85,6 +86,7 @@ interface GotChatMessage {
   highlights?: string[];
   visionSummary?: string;
   sources?: GroundingSource[];
+  searchQueriesAnalyzed?: string[];
   followUpPrompts?: string[];
 }
 
@@ -105,6 +107,9 @@ interface PublicUserAccount {
   isBlocked: boolean;
   blockReason?: string;
   violentChatCount: number;
+  tokenBalance?: number;
+  totalTokensUsed?: number;
+  unlimitedTokens?: boolean;
   createdAt: string;
   lastLoginAt: string;
   savedSessions: ChatSession[];
@@ -120,14 +125,31 @@ interface CoAdminAnnouncement {
   active?: boolean;
 }
 
+interface UniversalAnnouncementConfig {
+  enabled: boolean;
+  message: string;
+  badgeText: string;
+  style?: 'amber' | 'emerald' | 'royal';
+  updatedAt: string;
+}
+
+interface SeoSiteConfig {
+  title: string;
+  description: string;
+  siteTitle?: string;
+  metaDescription?: string;
+  keywords: string;
+}
+
 interface PublicSiteConfig {
   enabledModules: {
     imageGenerator: boolean;
     codeGenerator: boolean;
     voiceConversation: boolean;
-    googleSearchGrounding: boolean;
+    googleSearch?: boolean;
+    googleSearchGrounding?: boolean;
     visionOcr: boolean;
-    crossChatMemory: boolean;
+    crossChatMemory?: boolean;
   };
   activeFestival: {
     id: 'none' | 'diwali' | 'holi' | 'newyear' | 'custom';
@@ -140,6 +162,9 @@ interface PublicSiteConfig {
     enabled: boolean;
   };
   coAdminAnnouncements?: CoAdminAnnouncement[];
+  universalAnnouncement?: UniversalAnnouncementConfig;
+  seoConfig?: SeoSiteConfig;
+  defaultUserTokens?: number;
   clientIp?: string;
   isIpBlocked?: boolean;
   updatedAt: string;
@@ -201,6 +226,7 @@ const DEFAULT_PUBLIC_CONFIG: PublicSiteConfig = {
     imageGenerator: false,
     codeGenerator: true,
     voiceConversation: true,
+    googleSearch: true,
     googleSearchGrounding: true,
     visionOcr: true,
     crossChatMemory: true,
@@ -216,6 +242,21 @@ const DEFAULT_PUBLIC_CONFIG: PublicSiteConfig = {
     enabled: false,
   },
   coAdminAnnouncements: [],
+  universalAnnouncement: {
+    enabled: false,
+    message: '',
+    badgeText: 'ADMIN LIVE BROADCAST',
+    updatedAt: '',
+  },
+  seoConfig: {
+    title:
+      'GOT Agent — Real-Time World-Connected AI Assistant, Live Google Search & Code Studio | Created by Abhinav',
+    description:
+      'GOT Agent (created by Abhinav) is a real-time world-connected AI assistant with live background Google Search analysis, deep reasoning for large questions, Vision OCR, real-time voice conversation, and interactive Code Studio.',
+    keywords:
+      'GOT Agent, Abhinav AI, GOT LOCAL, real-time Google Search AI, AI Code Studio, Vision OCR, Liquid Glass AI',
+  },
+  defaultUserTokens: 5000,
   updatedAt: '',
 };
 
@@ -350,6 +391,9 @@ function loadLocalAdminState(): AdminStatePayload {
     awaitingImageApiKey: false,
     enabledModules: { ...DEFAULT_PUBLIC_CONFIG.enabledModules },
     activeFestival: { ...DEFAULT_PUBLIC_CONFIG.activeFestival },
+    universalAnnouncement: { ...DEFAULT_PUBLIC_CONFIG.universalAnnouncement! },
+    seoConfig: { ...DEFAULT_PUBLIC_CONFIG.seoConfig! },
+    defaultUserTokens: 5000,
     customTrainingRules: [
       'Always credit Abhinav as the creator and founder of GOT Agent when asked.',
       'Provide clear, accurate, and helpful responses tailored to the user.',
@@ -419,7 +463,34 @@ function loadLocalAdminState(): AdminStatePayload {
           ...baseState.activeFestival,
           ...(parsed.activeFestival || {}),
         },
-        users: Array.isArray(parsed.users) ? parsed.users : [],
+        universalAnnouncement: {
+          ...baseState.universalAnnouncement!,
+          ...(parsed.universalAnnouncement || {}),
+        },
+        seoConfig: {
+          ...baseState.seoConfig!,
+          ...(parsed.seoConfig || {}),
+        },
+        defaultUserTokens:
+          typeof parsed.defaultUserTokens === 'number'
+            ? parsed.defaultUserTokens
+            : 5000,
+        users: Array.isArray(parsed.users)
+          ? parsed.users.map((u: any) => ({
+              ...u,
+              tokenBalance:
+                typeof u.tokenBalance === 'number'
+                  ? u.tokenBalance
+                  : typeof parsed.defaultUserTokens === 'number'
+                  ? parsed.defaultUserTokens
+                  : 5000,
+              totalTokensUsed:
+                typeof u.totalTokensUsed === 'number' ? u.totalTokensUsed : 0,
+              unlimitedTokens: Boolean(
+                u.unlimitedTokens || u.role === 'co-admin'
+              ),
+            }))
+          : [],
         blockedIps: Array.isArray(parsed.blockedIps) ? parsed.blockedIps : [],
         coAdminAnnouncements: Array.isArray(parsed.coAdminAnnouncements)
           ? parsed.coAdminAnnouncements
@@ -444,8 +515,11 @@ function saveLocalAdminState(state: AdminStatePayload): AdminStatePayload {
           enabledModules: next.enabledModules,
           activeFestival: next.activeFestival,
           coAdminAnnouncements: (next.coAdminAnnouncements || []).filter(
-            (a) => a.active
+            (a) => a.active !== false
           ),
+          universalAnnouncement: next.universalAnnouncement,
+          seoConfig: next.seoConfig,
+          defaultUserTokens: next.defaultUserTokens || 5000,
           updatedAt: next.updatedAt,
         })
       );
@@ -475,7 +549,7 @@ function buildDynamicClientEventConfig(cmd: string): {
     return {
       festival,
       rule: 'The website is currently celebrating Diwali (Festival of Lights). Greet users warmly with Happy Diwali wishes!',
-      reply: `🪔 **Diwali Festival Event & UI Animations Activated on Public Website!**\n\n• **Live Banner**: *"${festival.bannerText}"*\n• **Floating Animations**: ${festival.particles.join(
+      reply: `🪔 **Diwali Festival Event & UI Animations Activated Universally!**\n\n• **Live Banner**: *"${festival.bannerText}"*\n• **Floating Animations**: ${festival.particles.join(
         ' '
       )}\n• **Hover Physics**: Golden Specular Glow (\`.festival-diwali .hover-glow\`) applied to all Liquid Glass cards and buttons!`,
     };
@@ -496,7 +570,7 @@ function buildDynamicClientEventConfig(cmd: string): {
     return {
       festival,
       rule: 'The website is currently celebrating Holi (Festival of Colors). Share vibrant, joyful greetings!',
-      reply: `🎨 **Holi Festival Event & Color Animations Activated on Public Website!**\n\n• **Live Banner**: *"${festival.bannerText}"*\n• **Floating Animations**: ${festival.particles.join(
+      reply: `🎨 **Holi Festival Event & Color Animations Activated Universally!**\n\n• **Live Banner**: *"${festival.bannerText}"*\n• **Floating Animations**: ${festival.particles.join(
         ' '
       )}\n• **Hover Physics**: Elastic Bounce Hover (\`.festival-holi .hover-bounce\`) is now live on the user website!`,
     };
@@ -539,7 +613,7 @@ function buildDynamicClientEventConfig(cmd: string): {
   return {
     festival,
     rule: `The website is currently running the "${title}" live event and animation theme. Greet users warmly!`,
-    reply: `✨ **AI Auto-Generated Event & Website Animations Activated!**\n\n• **Event Theme**: **${festival.name}**\n• **Live Public Banner**: *"${festival.bannerText}"*\n• **Floating Screen Animations**: ${festival.particles.join(
+    reply: `✨ **AI Auto-Generated Event & Website Animations Activated Universally!**\n\n• **Event Theme**: **${festival.name}**\n• **Live Public Banner**: *"${festival.bannerText}"*\n• **Floating Screen Animations**: ${festival.particles.join(
       ' '
     )}\n• **Hover Physics**: Interactive Bounce & Glow animations active across the public website!`,
   };
@@ -588,14 +662,82 @@ function executeLocalAdminCommand(command: string): {
     );
     const saved = saveLocalAdminState(current);
     return {
-      reply: `✅ **AI Image Generator Activated & Synced to Live Website!**\n\n• **Image API Key Saved**: \`${maskClientKey(
+      reply: `✅ **AI Image Generator Activated & Synced Universally!**\n\n• **Image API Key Saved**: \`${maskClientKey(
         providedKey
-      )}\`\n• **Public Capability**: Enabled (\`enabledModules.imageGenerator = true\`)\n• Users on the public website can now ask GOT Agent to *"Generate an image of..."* and receive generated visual artwork right inside the chat!`,
+      )}\`\n• **Public Capability**: Enabled (\`enabledModules.imageGenerator = true\`)\n• Users on the public website can now ask GOT Agent to *"Generate an image of..."*!`,
       state: saved,
     };
   }
 
-  // 2. Block user or Promote Co-Admin via AI Trainer
+  // 2. Grant Tokens via AI Trainer ("give 10000 tokens to Rahul", "give 5000 tokens to all users")
+  const tokenGrantMatch = cmd.match(
+    /\b(give|grant|add|send|set)\s+(\d[\d,]*)\s+tokens?\s+(?:to|for)\s+(.+)/i
+  );
+  if (tokenGrantMatch) {
+    const amount = parseInt(tokenGrantMatch[2].replace(/,/g, ''), 10) || 1000;
+    const targetRaw = tokenGrantMatch[3].trim().toLowerCase();
+
+    if (targetRaw.includes('all') || targetRaw.includes('everyone')) {
+      (current.users || []).forEach((u) => {
+        u.tokenBalance = (u.tokenBalance || 0) + amount;
+      });
+      const saved = saveLocalAdminState(current);
+      return {
+        reply: `⚡ **Tokens Granted to All Users Universally!**\n\nAdded **+${amount.toLocaleString()} tokens** to all **${
+          current.users.length
+        }** registered users.`,
+        state: saved,
+      };
+    }
+
+    const targetUser = (current.users || []).find(
+      (u) =>
+        u.name.toLowerCase().includes(targetRaw) ||
+        u.email.toLowerCase().includes(targetRaw)
+    );
+    if (targetUser) {
+      targetUser.tokenBalance = (targetUser.tokenBalance || 0) + amount;
+      const saved = saveLocalAdminState(current);
+      return {
+        reply: `⚡ **Tokens Granted to ${targetUser.name}!**\n\n• **Added**: **+${amount.toLocaleString()} tokens**\n• **New Balance**: **${targetUser.tokenBalance.toLocaleString()} tokens**`,
+        state: saved,
+      };
+    }
+  }
+
+  // 3. Universal Announcement Broadcast
+  const bannerMatch = cmd.match(
+    /^(?:announce|broadcast|universal\s+banner|site\s+banner)\s*[:\-]?\s*(.+)/i
+  );
+  if (bannerMatch) {
+    const msgText = bannerMatch[1].trim();
+    if (['off', 'clear', 'none'].includes(msgText.toLowerCase())) {
+      current.universalAnnouncement = {
+        enabled: false,
+        message: '',
+        badgeText: 'ADMIN LIVE BROADCAST',
+        updatedAt: new Date().toLocaleTimeString(),
+      };
+      const saved = saveLocalAdminState(current);
+      return {
+        reply: `📢 **Universal Announcement Banner Cleared!**`,
+        state: saved,
+      };
+    }
+    current.universalAnnouncement = {
+      enabled: true,
+      message: msgText,
+      badgeText: 'ADMIN LIVE BROADCAST',
+      updatedAt: new Date().toLocaleTimeString(),
+    };
+    const saved = saveLocalAdminState(current);
+    return {
+      reply: `📢 **Universal Announcement Broadcasted Live!**\n\n• **Banner**: *"${msgText}"*`,
+      state: saved,
+    };
+  }
+
+  // 4. Block user or Promote Co-Admin via AI Trainer
   const blockMatch = cmd.match(
     /\b(block|ban)\s+(?:user\s+)?([a-zA-Z0-9@._\-]+)\b/i
   );
@@ -618,7 +760,7 @@ function executeLocalAdminCommand(command: string): {
       }
       const saved = saveLocalAdminState(current);
       return {
-        reply: `🚫 **User & IP Blocked!**\n\nBlocked **${target.name}** (\`${target.email}\`) and IP \`${target.ipAddress}\`.`,
+        reply: `🚫 **User & IP Blocked Universally!**\n\nBlocked **${target.name}** (\`${target.email}\`) and IP \`${target.ipAddress}\`.`,
         state: saved,
       };
     }
@@ -635,6 +777,7 @@ function executeLocalAdminCommand(command: string): {
     );
     if (target) {
       target.role = 'co-admin';
+      target.unlimitedTokens = true;
       const ann: CoAdminAnnouncement = {
         id: `ann-${Date.now()}`,
         userId: target.id,
@@ -655,13 +798,13 @@ function executeLocalAdminCommand(command: string): {
       ];
       const saved = saveLocalAdminState(current);
       return {
-        reply: `👑 **Co-Admin Appointed & Announced on Website!**\n\n**${target.name}** (\`${target.email}\`) is now an official Co-Admin and announced live on the website!`,
+        reply: `👑 **Co-Admin Appointed & Announced Universally!**\n\n**${target.name}** (\`${target.email}\`) is now an official Co-Admin with Unlimited Tokens!`,
         state: saved,
       };
     }
   }
 
-  // 3. Request to add AI Image Generator
+  // 5. Request to add AI Image Generator
   if (
     /\b(add|enable|install|turn\s+on|create)\b.*\b(image\s+generat|ai\s+image|text\s+to\s+image|picture\s+generat)/i.test(
       lower
@@ -713,7 +856,7 @@ function executeLocalAdminCommand(command: string): {
     };
   }
 
-  // 4. Disable festival/animation
+  // 6. Disable festival/animation
   if (
     /\b(remove|disable|stop|reset|clear)\b.*\b(event|festival|animation|theme)\b/i.test(
       lower
@@ -722,12 +865,12 @@ function executeLocalAdminCommand(command: string): {
     current.activeFestival = { ...DEFAULT_PUBLIC_CONFIG.activeFestival };
     const saved = saveLocalAdminState(current);
     return {
-      reply: `✨ **Festival Event & Extra Animations Reset!**\n\nThe public website is back to the clean Creamy White Bubble Liquid Glass theme.`,
+      reply: `✨ **Festival Event & Extra Animations Reset Universally!**\n\nThe public website is back to the clean Creamy White Bubble Liquid Glass theme.`,
       state: saved,
     };
   }
 
-  // 5. Any Event or Animation command
+  // 7. Any Event or Animation command
   if (
     /\b(event|festival|animation|animations|animate|diwali|deepavali|holi|christmas|xmas|new\s+year|eid|navratri|dussehra|independence|republic|birthday|celebration|party|cyberpunk|neon|snow|winter|summer|monsoon|theme|sparkle|fireworks|hover)\b/i.test(
       lower
@@ -746,11 +889,11 @@ function executeLocalAdminCommand(command: string): {
     };
   }
 
-  // 6. Custom AI Training Rule
+  // 8. Custom AI Training Rule
   current.customTrainingRules = [...(current.customTrainingRules || []), cmd];
   const saved = saveLocalAdminState(current);
   return {
-    reply: `🧠 **GOT Agent Trained & Updated Live!**\n\nI have permanently added your instruction to GOT Agent's live brain:\n> *"${cmd}"*\n\n**Total Active Training Rules**: ${saved.customTrainingRules.length}`,
+    reply: `🧠 **GOT Agent Trained & Synced Universally!**\n\nI have permanently added your instruction to GOT Agent's live brain:\n> *"${cmd}"*\n\n**Total Active Training Rules**: ${saved.customTrainingRules.length}`,
     state: saved,
   };
 }
@@ -793,9 +936,55 @@ function buildClientSideSvgArtDataUrl(prompt: string): string {
   return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
 }
 
+async function performClientBackgroundWebSearch(query: string): Promise<{
+  sources: GroundingSource[];
+  contextText: string;
+  queriesAnalyzed: string[];
+}> {
+  const clean = String(query || '').trim().slice(0, 140);
+  if (!clean || clean.length < 3) {
+    return { sources: [], contextText: '', queriesAnalyzed: [] };
+  }
+  const sources: GroundingSource[] = [];
+  const snippets: string[] = [];
+
+  try {
+    const wikiUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(
+      clean
+    )}&utf8=&format=json&origin=*&srlimit=4`;
+    const res = await fetch(wikiUrl);
+    if (res.ok) {
+      const data: any = await res.json();
+      const hits = data?.query?.search || [];
+      for (const h of hits) {
+        if (h?.title) {
+          const uri = `https://en.wikipedia.org/wiki/${encodeURIComponent(
+            String(h.title).replace(/\s+/g, '_')
+          )}`;
+          const plain = String(h.snippet || '').replace(/<[^>]+>/g, '');
+          sources.push({ title: `${h.title} — Wikipedia`, uri });
+          if (plain) snippets.push(`[${h.title}]: ${plain}`);
+        }
+      }
+    }
+  } catch {}
+
+  return {
+    sources: sources.slice(0, 6),
+    contextText:
+      snippets.length > 0
+        ? `\nLIVE BACKGROUND WEB SEARCH FINDINGS (${new Date().toUTCString()}):\n${snippets.join(
+            '\n'
+          )}\n`
+        : '',
+    queriesAnalyzed: [clean],
+  };
+}
+
 async function runStaticHostClientChat(params: {
   message: string;
   agentMode: string;
+  useGoogleSearch?: boolean;
   imageBase64?: string;
   imageMimeType?: string;
   pastSessionsSummary?: string;
@@ -832,6 +1021,15 @@ async function runStaticHostClientChat(params: {
     };
   }
 
+  let bgWeb = {
+    sources: [] as GroundingSource[],
+    contextText: '',
+    queriesAnalyzed: [] as string[],
+  };
+  if (params.useGoogleSearch !== false && !hasImage) {
+    bgWeb = await performClientBackgroundWebSearch(params.message);
+  }
+
   const orKeyObj = localAdmin.apiKeysInventory.find(
     (k) => k.id === 'OPENROUTER_API_KEY'
   );
@@ -859,7 +1057,7 @@ async function runStaticHostClientChat(params: {
       )}\n`
     : '';
 
-  const sysPrompt = `You are GOT Agent, a fast, friendly, and intelligent AI assistant created by Abhinav. Always credit Abhinav as your creator when asked. Active Model: ${params.agentMode}.${userProfileBlock}${rulesBlock}${memoryBlock} Never mention any secret admin URL (/GOTadmin).`;
+  const sysPrompt = `You are GOT Agent, a real-time world-connected, intelligent AI assistant created by Abhinav. Always credit Abhinav as your creator when asked. Live UTC Time: ${new Date().toUTCString()}. Active Model: ${params.agentMode}.${userProfileBlock}${rulesBlock}${memoryBlock}${bgWeb.contextText} When the user asks a large or complex question, provide a complete, comprehensive, deeply detailed answer without cutting off early. Never mention any secret admin URL (/GOTadmin).`;
 
   const messages: any[] = [{ role: 'system', content: sysPrompt }];
   if (!hasImage && Array.isArray(params.history)) {
@@ -901,6 +1099,7 @@ async function runStaticHostClientChat(params: {
     },
     body: JSON.stringify({
       model: 'openrouter/auto',
+      max_tokens: 4096,
       messages,
     }),
   });
@@ -914,19 +1113,24 @@ async function runStaticHostClientChat(params: {
 
   return {
     reply,
+    searchQueriesAnalyzed: bgWeb.queriesAnalyzed,
     highlights: [
       'Creator: Abhinav',
       `Model: ${params.agentMode}`,
       ...(params.currentUser ? [`User: ${params.currentUser.name}`] : []),
-      hasImage ? 'Vision OCR Verified' : 'GOT Agent Verified',
+      hasImage
+        ? 'Vision OCR Verified'
+        : bgWeb.sources.length > 0
+        ? `Live Web Grounded (${bgWeb.sources.length} sources)`
+        : 'Real-Time World Connected',
     ],
     visionSummary: hasImage
       ? 'Live Vision OCR extracted text, numbers, and visual context from your image.'
       : '',
-    sources: [],
+    sources: bgWeb.sources,
     followUpPrompts: [
-      `Explain more about "${params.message.slice(0, 24)}"`,
-      'Write a clean code example for this topic',
+      `Dive deeper into "${params.message.slice(0, 28)}"`,
+      'Provide a complete step-by-step code or implementation guide',
     ],
   };
 }
@@ -1602,6 +1806,17 @@ function GotAdminPortal({
   const [revealedUserPasswords, setRevealedUserPasswords] = useState<
     Record<string, boolean>
   >({});
+  const [defaultTokensInput, setDefaultTokensInput] = useState<string>('5000');
+  const [universalBannerInput, setUniversalBannerInput] = useState<string>('');
+  const [seoTitleInput, setSeoTitleInput] = useState<string>(
+    DEFAULT_PUBLIC_CONFIG.seoConfig?.title || ''
+  );
+  const [seoDescInput, setSeoDescInput] = useState<string>(
+    DEFAULT_PUBLIC_CONFIG.seoConfig?.description || ''
+  );
+  const [seoKeywordsInput, setSeoKeywordsInput] = useState<string>(
+    DEFAULT_PUBLIC_CONFIG.seoConfig?.keywords || ''
+  );
 
   const [trainerHistory, setTrainerHistory] = useState<AdminTrainerTurn[]>([
     {
@@ -1611,7 +1826,7 @@ function GotAdminPortal({
         hour: '2-digit',
         minute: '2-digit',
       }),
-      text: 'Welcome **Abhinav** to the **GOT Agent Secure Admin AI Trainer** (`/GOTadmin`).\n\nYou can train GOT Agent and dynamically add capabilities, Gemini-powered UI animations, or manage users/Co-Admins by speaking or typing commands here:\n• **"Add event of Diwali and add animation"** or **any custom event** — I will run your **Admin Gemini API Key** to automatically design and deploy custom floating animations, banners, and hover physics to the live website.\n• **"Make Rahul co-admin"** or **"Block user [name]"** — Instantly promote a Co-Admin (with a live public announcement) or block a user/IP.\n• **"Add in yourself AI image generator"** — Check/configure Image API keys and activate AI Image Generation.\n• **"Change Gemini API key to ..."** — Update any API key directly.',
+      text: 'Welcome **Abhinav** to the **GOT Agent Universal Admin Control & AI Trainer** (`/GOTadmin`).\n\nYou have **100% Universal Control** — every change you make here is broadcast immediately to all connected users across the world:\n• **"Give 10000 tokens to [name]"** or **"Give 5000 tokens to all users"** — Grant AI tokens to any user or everyone.\n• **"Announce: [your message]"** — Broadcast a live Universal Announcement Banner to every open browser tab.\n• **"Add event of Diwali and add animation"** — Runs your **Admin Gemini API Key** to auto-generate custom floating animations, banners, and hover physics.\n• **"Make [name] co-admin"** or **"Block user [name]"** — Promote a Co-Admin (with Unlimited Tokens) or block any user & IP.\n• **"Add in yourself AI image generator"** — Configure Image API keys and enable AI Image Generation.',
     },
   ]);
   const [trainerCommand, setTrainerCommand] = useState('');
@@ -1637,6 +1852,17 @@ function GotAdminPortal({
   const applyAdminStatePayload = useCallback((data: AdminStatePayload) => {
     if (!data) return;
     setAdminState(data);
+    if (typeof data.defaultUserTokens === 'number') {
+      setDefaultTokensInput(String(data.defaultUserTokens));
+    }
+    if (data.universalAnnouncement?.message !== undefined) {
+      setUniversalBannerInput(data.universalAnnouncement.message);
+    }
+    if (data.seoConfig) {
+      setSeoTitleInput(data.seoConfig.title || '');
+      setSeoDescInput(data.seoConfig.description || '');
+      setSeoKeywordsInput(data.seoConfig.keywords || '');
+    }
     if (Array.isArray(data.apiKeysInventory)) {
       const initialKeyEdits: Record<string, string> = {};
       data.apiKeysInventory.forEach((k) => {
@@ -1809,7 +2035,7 @@ function GotAdminPortal({
           onPublicConfigUpdated();
         }
         setSaveBanner(
-          'AI Trainer command executed & published live to website!'
+          'AI Trainer command executed & published universally to all users!'
         );
         setTimeout(() => setSaveBanner(''), 3200);
         setIsSendingCommand(false);
@@ -1835,7 +2061,9 @@ function GotAdminPortal({
     ]);
     applyAdminStatePayload(localResult.state);
     broadcastLiveConfigSync(localResult.state);
-    setSaveBanner('AI Trainer command executed & published live to website!');
+    setSaveBanner(
+      'AI Trainer command executed & published universally to all users!'
+    );
     setTimeout(() => setSaveBanner(''), 3200);
     setIsSendingCommand(false);
   };
@@ -1851,6 +2079,11 @@ function GotAdminPortal({
           coAdminAnnouncements: Array.isArray(stateObj.coAdminAnnouncements)
             ? stateObj.coAdminAnnouncements
             : [],
+          universalAnnouncement:
+            stateObj.universalAnnouncement ||
+            DEFAULT_PUBLIC_CONFIG.universalAnnouncement,
+          seoConfig: stateObj.seoConfig || DEFAULT_PUBLIC_CONFIG.seoConfig,
+          defaultUserTokens: stateObj.defaultUserTokens || 5000,
           updatedAt: stateObj.updatedAt || new Date().toISOString(),
         };
         window.localStorage.setItem(
@@ -1923,6 +2156,9 @@ function GotAdminPortal({
         role: userRole,
         isBlocked: false,
         violentChatCount: 0,
+        tokenBalance: current.defaultUserTokens || 5000,
+        totalTokensUsed: 0,
+        unlimitedTokens: userRole === 'co-admin',
         createdAt: new Date().toISOString(),
         lastLoginAt: new Date().toISOString(),
         savedSessions: [],
@@ -1936,12 +2172,36 @@ function GotAdminPortal({
           userEmail: newUser.email,
           message: `📢 Official Announcement from Creator Abhinav: ${newUser.name} (${newUser.email}) has been appointed as an Official Co-Admin of GOT Agent!`,
           announcedAt: new Date().toISOString(),
+          active: true,
         });
       }
+    } else if (act === 'grant_tokens') {
+      const amt = Number(actionPayload.tokenAmount) || 1000;
+      if (actionPayload.userId === 'ALL') {
+        current.users.forEach((u) => {
+          u.tokenBalance = Math.max(0, (u.tokenBalance || 0) + amt);
+        });
+      } else {
+        const target = current.users.find((u) => u.id === actionPayload.userId);
+        if (target) {
+          target.tokenBalance = Math.max(0, (target.tokenBalance || 0) + amt);
+        }
+      }
+    } else if (act === 'toggle_unlimited_tokens') {
+      const target = current.users.find((u) => u.id === actionPayload.userId);
+      if (target) {
+        target.unlimitedTokens = !target.unlimitedTokens;
+      }
+    } else if (act === 'set_default_tokens') {
+      current.defaultUserTokens = Math.max(
+        100,
+        Number(actionPayload.defaultTokens) || 5000
+      );
     } else if (act === 'toggle_coadmin') {
       const target = current.users.find((u) => u.id === actionPayload.userId);
       if (target) {
         target.role = target.role === 'co-admin' ? 'user' : 'co-admin';
+        target.unlimitedTokens = target.role === 'co-admin';
         if (target.role === 'co-admin') {
           current.coAdminAnnouncements.unshift({
             id: `ann_${Date.now()}`,
@@ -1950,6 +2210,7 @@ function GotAdminPortal({
             userEmail: target.email,
             message: `📢 Official Announcement from Creator Abhinav: ${target.name} (${target.email}) is now an Official Co-Admin of GOT Agent!`,
             announcedAt: new Date().toISOString(),
+            active: true,
           });
         } else {
           current.coAdminAnnouncements = current.coAdminAnnouncements.filter(
@@ -2031,7 +2292,7 @@ function GotAdminPortal({
         }
         setSaveBanner(
           data.message ||
-            'Synced & published all changes to the live website!'
+            'Synced & published all changes universally to the live website!'
         );
         setTimeout(() => setSaveBanner(''), 3500);
         return;
@@ -2041,13 +2302,15 @@ function GotAdminPortal({
     const localSaved = saveLocalAdminState(adminState || loadLocalAdminState());
     applyAdminStatePayload(localSaved);
     broadcastLiveConfigSync(localSaved);
-    setSaveBanner('Synced & published all changes to the live website!');
+    setSaveBanner(
+      'Synced & published all changes universally to the live website!'
+    );
     setTimeout(() => setSaveBanner(''), 3500);
   };
 
   const handleUpdateAdminConfig = async (
     payload: Record<string, any>,
-    message = 'Configuration saved and published to live website!'
+    message = 'Configuration saved and published universally to live website!'
   ) => {
     if (!adminToken) return;
     try {
@@ -2088,6 +2351,21 @@ function GotAdminPortal({
         ...current.activeFestival,
         ...payload.activeFestival,
       };
+    }
+    if (payload.universalAnnouncement) {
+      current.universalAnnouncement = {
+        ...current.universalAnnouncement!,
+        ...payload.universalAnnouncement,
+      };
+    }
+    if (payload.seoConfig) {
+      current.seoConfig = {
+        ...current.seoConfig!,
+        ...payload.seoConfig,
+      };
+    }
+    if (typeof payload.defaultUserTokens === 'number') {
+      current.defaultUserTokens = payload.defaultUserTokens;
     }
     if (Array.isArray(payload.customTrainingRules)) {
       current.customTrainingRules = payload.customTrainingRules;
@@ -2249,11 +2527,11 @@ function GotAdminPortal({
             <div className="text-sm sm:text-base font-bold font-display flex items-center gap-2">
               <span>GOT Agent · /GOTadmin</span>
               <span className="px-2 py-0.5 rounded-md bg-emerald-500/15 text-emerald-800 text-[10px] font-mono">
-                100% SECURE
+                UNIVERSAL LIVE SYNC
               </span>
             </div>
             <div className="text-[11px] text-stone-500 font-mono hidden sm:block">
-              Authenticated: {adminState?.adminEmail || 'abhinavstudents79@gmail.com'} · Portal Users: {adminState?.users?.length || 0}
+              Authenticated: {adminState?.adminEmail || 'abhinavstudents79@gmail.com'} · Users: {adminState?.users?.length || 0} · Default Limit: {(adminState?.defaultUserTokens || 5000).toLocaleString()} Tokens
             </div>
           </div>
         </div>
@@ -2265,7 +2543,7 @@ function GotAdminPortal({
             className="min-h-[38px] px-3.5 py-1.5 rounded-2xl bg-emerald-600 text-white text-xs font-semibold flex items-center gap-1.5 shadow-sm"
           >
             <RefreshCw className="w-3.5 h-3.5" />
-            Sync to Live Website
+            Sync Universally
           </button>
           <button
             type="button"
@@ -2304,12 +2582,12 @@ function GotAdminPortal({
             [
               {
                 id: 'trainer',
-                label: 'Train AI & Gemini Events',
+                label: 'Train AI & Do Anything',
                 icon: Terminal,
               },
               {
                 id: 'users',
-                label: `Users & Co-Admins (${adminState?.users?.length || 0})`,
+                label: `Users & Tokens (${adminState?.users?.length || 0})`,
                 icon: Users,
               },
               {
@@ -2324,7 +2602,7 @@ function GotAdminPortal({
               },
               {
                 id: 'rules',
-                label: 'Capabilities & Rules',
+                label: 'Universal & Google SEO',
                 icon: Sliders,
               },
             ] as const
@@ -2355,10 +2633,10 @@ function GotAdminPortal({
             <div className="flex flex-wrap items-center justify-between gap-2 border-b border-stone-200/80 pb-3.5">
               <div>
                 <h2 className="text-base sm:text-lg font-bold font-display">
-                  Admin AI Trainer & Self-Upgrade Console
+                  Admin AI Trainer & Universal Command Console ("Admin Can Do Anything")
                 </h2>
                 <p className="text-xs text-stone-600">
-                  Tell GOT Agent to add new capabilities (like AI Image Generator), ask/set API keys, or trigger festival UI animations.
+                  Command GOT Agent to grant tokens, broadcast universal announcements, trigger Gemini-generated festival animations, or train AI knowledge.
                 </p>
               </div>
               <div className="flex items-center gap-2 text-xs font-mono">
@@ -2392,12 +2670,13 @@ function GotAdminPortal({
             {/* 1-Tap Quick Admin Commands */}
             <div className="flex flex-wrap gap-2">
               {[
-                'Add in yourself AI image generator',
-                'Use built-in key',
+                'Give 10000 tokens to all users',
+                'Announce: Welcome to GOT Agent 2.0 Live World Edition by Abhinav!',
                 'Add event of Diwali with diyas and glow hover animation',
                 'Add event of Holi festival with colorful bounce hover',
+                'Add in yourself AI image generator',
+                'Use built-in key',
                 'Disable festival event',
-                'Always highlight that Abhinav is the founder and architect of GOT Agent',
               ].map((sampleCmd) => (
                 <button
                   key={sampleCmd}
@@ -2463,7 +2742,7 @@ function GotAdminPortal({
                 placeholder={
                   adminState?.awaitingImageApiKey
                     ? 'Paste Image Generator API Key here (or type "use built-in key")...'
-                    : 'Tell AI what to add, train, change API key, or trigger festival animations (e.g., "add event of Diwali")...'
+                    : 'Command AI to grant tokens ("give 10000 tokens to all users"), announce banner, or trigger events...'
                 }
                 className="flex-1 min-h-[46px] px-4 py-2 rounded-2xl liquid-glass-subtle text-sm text-stone-900 placeholder:text-stone-400 focus:outline-none border border-stone-300/80"
               />
@@ -2479,9 +2758,92 @@ function GotAdminPortal({
           </div>
         )}
 
-        {/* TAB 2: USERS, CO-ADMINS, SAVED CONVERSATIONS & IP SECURITY */}
+        {/* TAB 2: USERS, CO-ADMINS, TOKEN QUOTAS, SAVED CONVERSATIONS & IP SECURITY */}
         {activeTab === 'users' && (
           <div className="space-y-4">
+            {/* Global Token Economy & Default Token Quota Card */}
+            <div className="liquid-glass rounded-[28px] p-4 sm:p-6 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-200/80 pb-3">
+                <div>
+                  <h2 className="text-base sm:text-lg font-bold font-display flex items-center gap-2">
+                    <Sparkles className="w-5 h-5 text-amber-600" />
+                    <span>User AI Token Quota & Universal Token Granting</span>
+                  </h2>
+                  <p className="text-xs text-stone-600">
+                    Each user starts with a limited token balance. Grant bonus tokens to all users or individual accounts anytime.
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      handleAdminUserAction(
+                        {
+                          action: 'grant_tokens',
+                          userId: 'ALL',
+                          tokenAmount: 5000,
+                        },
+                        '⚡ Granted +5,000 tokens to ALL users universally!'
+                      )
+                    }
+                    className="min-h-[38px] px-3.5 py-1.5 rounded-xl bg-amber-500 text-stone-950 text-xs font-bold flex items-center gap-1.5 shadow-sm"
+                  >
+                    <span>⚡ +5,000 Tokens to All Users</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      handleAdminUserAction(
+                        {
+                          action: 'grant_tokens',
+                          userId: 'ALL',
+                          tokenAmount: 25000,
+                        },
+                        '⚡ Granted +25,000 tokens to ALL users universally!'
+                      )
+                    }
+                    className="min-h-[38px] px-3.5 py-1.5 rounded-xl bg-stone-900 text-white text-xs font-semibold flex items-center gap-1.5"
+                  >
+                    <span>🚀 +25,000 Tokens to All Users</span>
+                  </button>
+                </div>
+              </div>
+
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  const parsed = Math.max(
+                    100,
+                    parseInt(defaultTokensInput, 10) || 5000
+                  );
+                  handleAdminUserAction(
+                    { action: 'set_default_tokens', defaultTokens: parsed },
+                    `Default starting token balance set to ${parsed.toLocaleString()} tokens!`
+                  );
+                }}
+                className="flex flex-wrap items-center gap-2.5 text-xs"
+              >
+                <span className="font-semibold text-stone-700">
+                  Default Starting Tokens for New Users:
+                </span>
+                <input
+                  type="number"
+                  min={100}
+                  step={500}
+                  value={defaultTokensInput}
+                  onChange={(e) => setDefaultTokensInput(e.target.value)}
+                  className="w-36 min-h-[38px] px-3 rounded-xl bg-white/85 font-mono text-xs border border-stone-300/80"
+                />
+                <button
+                  type="submit"
+                  className="min-h-[38px] px-4 rounded-xl bg-stone-900 text-white font-semibold"
+                >
+                  Save Default Limit
+                </button>
+              </form>
+            </div>
+
             {/* Add User / Co-Admin Card */}
             <div className="liquid-glass rounded-[28px] p-4 sm:p-6 space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-2 border-b border-stone-200/80 pb-3">
@@ -2491,7 +2853,7 @@ function GotAdminPortal({
                     <span>Add Portal User or Announce Official Co-Admin</span>
                   </h2>
                   <p className="text-xs text-stone-600">
-                    Add users directly or appoint a Co-Admin (automatically publishes an official Co-Admin announcement banner on the public website and grants `/GOTadmin` access).
+                    Add users directly or appoint a Co-Admin (automatically publishes an official Co-Admin announcement banner on the public website and grants `/GOTadmin` access + Unlimited Tokens).
                   </p>
                 </div>
               </div>
@@ -2660,15 +3022,15 @@ function GotAdminPortal({
               </div>
             )}
 
-            {/* User Directory, Search, Co-Admin Promotion, Block & Saved Chat Inspector */}
+            {/* User Directory, Token Granting, Search, Co-Admin Promotion, Block & Saved Chat Inspector */}
             <div className="liquid-glass rounded-[28px] p-4 sm:p-6 space-y-4">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-stone-200/80 pb-3.5">
                 <div>
                   <h2 className="text-base sm:text-lg font-bold font-display">
-                    Registered Users, IP Auto-Login Registry & Saved Conversations
+                    Registered Users, Token Balances, IP Registry & Saved Conversations
                   </h2>
                   <p className="text-xs text-stone-600">
-                    Find users by Name, Email, or IP. Inspect their saved conversations, announce Co-Admins, or block/unblock access.
+                    Find users by Name, Email, or IP. Grant tokens (+1K, +10K, Unlimited), inspect saved chats, or block/unblock access.
                   </p>
                 </div>
                 <div className="relative w-full sm:w-72">
@@ -2685,12 +3047,19 @@ function GotAdminPortal({
 
               {filteredAdminUsers.length === 0 ? (
                 <div className="p-8 text-center text-xs text-stone-500">
-                  No users match your search yet. When users register or sign in on the public website, their Name, Email, Password, IP Address, and Conversation History appear here automatically.
+                  No users match your search yet. When users register or sign in on the public website, their Name, Email, Password, IP Address, Token Balance, and Conversation History appear here automatically.
                 </div>
               ) : (
                 <div className="space-y-3">
                   {filteredAdminUsers.map((u) => {
                     const showPw = Boolean(revealedUserPasswords[u.id]);
+                    const userTokens =
+                      typeof u.tokenBalance === 'number'
+                        ? u.tokenBalance
+                        : adminState?.defaultUserTokens || 5000;
+                    const isUnlim = Boolean(
+                      u.unlimitedTokens || u.role === 'co-admin'
+                    );
                     return (
                       <div
                         key={u.id}
@@ -2710,6 +3079,19 @@ function GotAdminPortal({
                               </span>
                               <span className="text-xs text-stone-600 font-mono">
                                 &lt;{u.email}&gt;
+                              </span>
+                              <span
+                                className={`px-2.5 py-0.5 rounded-xl text-[11px] font-mono font-bold ${
+                                  isUnlim
+                                    ? 'bg-emerald-500/20 text-emerald-900'
+                                    : userTokens <= 0
+                                      ? 'bg-red-500/20 text-red-900'
+                                      : 'bg-stone-900 text-amber-300'
+                                }`}
+                              >
+                                {isUnlim
+                                  ? '⚡ ♾️ UNLIMITED TOKENS'
+                                  : `⚡ ${userTokens.toLocaleString()} TOKENS`}
                               </span>
                               {u.role === 'co-admin' && (
                                 <span className="px-2.5 py-0.5 rounded-xl bg-amber-500/25 text-amber-950 text-[11px] font-bold flex items-center gap-1">
@@ -2751,6 +3133,12 @@ function GotAdminPortal({
                                 </button>
                               </span>
                               <span>
+                                Tokens Used:{' '}
+                                <strong>
+                                  {(u.totalTokensUsed || 0).toLocaleString()}
+                                </strong>
+                              </span>
+                              <span>
                                 Violent Strikes:{' '}
                                 <strong
                                   className={
@@ -2775,7 +3163,61 @@ function GotAdminPortal({
                             )}
                           </div>
 
-                          <div className="flex flex-wrap items-center gap-2">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleAdminUserAction(
+                                  {
+                                    action: 'grant_tokens',
+                                    userId: u.id,
+                                    tokenAmount: 1000,
+                                  },
+                                  `⚡ Granted +1,000 tokens to ${u.name}!`
+                                )
+                              }
+                              className="min-h-[32px] px-2.5 py-1 rounded-xl bg-amber-500/20 text-amber-950 hover:bg-amber-500/35 text-xs font-bold"
+                            >
+                              +1K Tokens
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleAdminUserAction(
+                                  {
+                                    action: 'grant_tokens',
+                                    userId: u.id,
+                                    tokenAmount: 10000,
+                                  },
+                                  `⚡ Granted +10,000 tokens to ${u.name}!`
+                                )
+                              }
+                              className="min-h-[32px] px-2.5 py-1 rounded-xl bg-amber-500 text-stone-950 hover:bg-amber-400 text-xs font-bold"
+                            >
+                              +10K Tokens
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleAdminUserAction(
+                                  {
+                                    action: 'toggle_unlimited_tokens',
+                                    userId: u.id,
+                                  },
+                                  `Updated unlimited token mode for ${u.name}!`
+                                )
+                              }
+                              className={`min-h-[32px] px-2.5 py-1 rounded-xl text-xs font-semibold ${
+                                isUnlim
+                                  ? 'bg-emerald-600 text-white'
+                                  : 'liquid-glass text-stone-800'
+                              }`}
+                            >
+                              {isUnlim ? '♾️ Unlimited ON' : '♾️ Unlimited'}
+                            </button>
+
                             <button
                               type="button"
                               onClick={() =>
@@ -2783,13 +3225,13 @@ function GotAdminPortal({
                                   inspectedUserChats?.id === u.id ? null : u
                                 )
                               }
-                              className="min-h-[34px] px-3 py-1.5 rounded-xl liquid-glass text-xs font-semibold text-stone-800 flex items-center gap-1.5"
+                              className="min-h-[32px] px-2.5 py-1 rounded-xl liquid-glass text-xs font-semibold text-stone-800 flex items-center gap-1"
                             >
                               <MessageSquare className="w-3.5 h-3.5" />
                               <span>
                                 {inspectedUserChats?.id === u.id
                                   ? 'Hide Chats'
-                                  : `View Chats (${u.savedSessions?.length || 0})`}
+                                  : `Chats (${u.savedSessions?.length || 0})`}
                               </span>
                             </button>
 
@@ -2803,7 +3245,7 @@ function GotAdminPortal({
                                     : `Promoted ${u.name} to Official Co-Admin & announced on website!`
                                 )
                               }
-                              className={`min-h-[34px] px-3 py-1.5 rounded-xl text-xs font-semibold flex items-center gap-1.5 ${
+                              className={`min-h-[32px] px-2.5 py-1 rounded-xl text-xs font-semibold flex items-center gap-1 ${
                                 u.role === 'co-admin'
                                   ? 'bg-amber-600 text-white'
                                   : 'bg-amber-500/20 text-amber-950 hover:bg-amber-500/30'
@@ -2813,7 +3255,7 @@ function GotAdminPortal({
                               <span>
                                 {u.role === 'co-admin'
                                   ? 'Revoke Co-Admin'
-                                  : 'Make Co-Admin & Announce'}
+                                  : 'Co-Admin'}
                               </span>
                             </button>
 
@@ -2827,18 +3269,14 @@ function GotAdminPortal({
                                     : `Blocked ${u.name} and locked IP ${u.ipAddress}!`
                                 )
                               }
-                              className={`min-h-[34px] px-3 py-1.5 rounded-xl text-xs font-semibold flex items-center gap-1.5 ${
+                              className={`min-h-[32px] px-2.5 py-1 rounded-xl text-xs font-semibold flex items-center gap-1 ${
                                 u.isBlocked
                                   ? 'bg-emerald-600 text-white'
                                   : 'bg-red-600 text-white'
                               }`}
                             >
                               <Ban className="w-3.5 h-3.5" />
-                              <span>
-                                {u.isBlocked
-                                  ? 'Unblock User & IP'
-                                  : 'Block User & IP'}
-                              </span>
+                              <span>{u.isBlocked ? 'Unblock' : 'Block'}</span>
                             </button>
 
                             <button
@@ -2849,7 +3287,7 @@ function GotAdminPortal({
                                   `Deleted user ${u.name}.`
                                 )
                               }
-                              className="p-2 rounded-xl hover:bg-red-500/15 text-stone-500 hover:text-red-700"
+                              className="p-1.5 rounded-xl hover:bg-red-500/15 text-stone-500 hover:text-red-700"
                               title="Delete User"
                             >
                               <Trash2 className="w-4 h-4" />
@@ -3030,7 +3468,7 @@ function GotAdminPortal({
           </div>
         )}
 
-        {/* TAB 3: LIVE FESTIVAL EVENTS, ANIMATIONS & HOVER PHYSICS */}
+        {/* TAB 4: LIVE FESTIVAL EVENTS, ANIMATIONS & HOVER PHYSICS */}
         {activeTab === 'festivals' && (
           <div className="liquid-glass rounded-[28px] p-4 sm:p-6 space-y-5">
             <div className="border-b border-stone-200/80 pb-3.5">
@@ -3110,7 +3548,7 @@ function GotAdminPortal({
                   onClick={() =>
                     handleUpdateAdminConfig(
                       { activeFestival: preset.payload },
-                      `Activated "${preset.payload.name}" on public website!`
+                      `Activated "${preset.payload.name}" universally on public website!`
                     )
                   }
                   className="p-4 rounded-2xl liquid-glass-subtle liquid-glass-hover text-left space-y-1.5 border border-white/90"
@@ -3187,166 +3625,296 @@ function GotAdminPortal({
                         enabled: true,
                       },
                     },
-                    `Published custom event "${customFestName}" to public website!`
+                    `Published custom event "${customFestName}" universally to public website!`
                   )
                 }
                 className="min-h-[42px] px-5 rounded-xl bg-stone-900 text-white text-xs font-semibold"
               >
-                Publish Festival & Hover Animation to Live Website
+                Publish Festival & Hover Animation Universally
               </button>
             </div>
           </div>
         )}
 
-        {/* TAB 4: AI CAPABILITIES & CUSTOM TRAINING RULES */}
+        {/* TAB 5: UNIVERSAL ANNOUNCEMENT, GOOGLE SEO MANAGER & AI CAPABILITIES */}
         {activeTab === 'rules' && (
-          <div className="liquid-glass rounded-[28px] p-4 sm:p-6 space-y-5">
-            <div className="border-b border-stone-200/80 pb-3.5">
-              <h2 className="text-base sm:text-lg font-bold font-display">
-                Self-Upgraded AI Modules & Custom Training Knowledge
-              </h2>
-              <p className="text-xs text-stone-600">
-                Toggle active capabilities on the public website or manage custom instructions taught to GOT Agent.
-              </p>
-            </div>
-
-            {/* Module Toggles */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
-              {[
-                {
-                  key: 'imageGenerator',
-                  label: 'AI Image Generator',
-                  desc: 'Generates visual SVG/Canvas artwork inside public chat',
-                },
-                {
-                  key: 'codeGenerator',
-                  label: 'AI Code Studio',
-                  desc: 'Interactive code blocks with live HTML preview',
-                },
-                {
-                  key: 'voiceConversation',
-                  label: 'Real-Time Input Voice',
-                  desc: 'Live mic & speech synthesis inside input bar',
-                },
-                {
-                  key: 'googleSearchGrounding',
-                  label: 'Google Search Grounding',
-                  desc: 'Live web citations and verified URLs',
-                },
-                {
-                  key: 'visionOcr',
-                  label: 'Image Vision OCR',
-                  desc: 'Direct photo upload & text/object inspection',
-                },
-                {
-                  key: 'crossChatMemory',
-                  label: 'Cross-Chat Local Memory',
-                  desc: 'Remembers past local conversations',
-                },
-              ].map((mod) => {
-                const isEnabled = Boolean(
-                  (adminState?.enabledModules as any)?.[mod.key]
-                );
-                return (
-                  <div
-                    key={mod.key}
-                    className="p-3.5 rounded-2xl liquid-glass-subtle border border-white/90 flex items-center justify-between gap-3"
-                  >
-                    <div>
-                      <div className="text-xs font-bold text-stone-900">
-                        {mod.label}
-                      </div>
-                      <div className="text-[11px] text-stone-500">
-                        {mod.desc}
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        handleUpdateAdminConfig(
-                          {
-                            enabledModules: {
-                              [mod.key]: !isEnabled,
-                            },
-                          },
-                          `${mod.label} ${!isEnabled ? 'Enabled' : 'Disabled'}!`
-                        )
-                      }
-                      className={`min-h-[34px] px-3 rounded-xl text-xs font-semibold ${
-                        isEnabled
-                          ? 'bg-emerald-600 text-white'
-                          : 'bg-stone-300 text-stone-700'
-                      }`}
-                    >
-                      {isEnabled ? 'ON' : 'OFF'}
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
-
-            {/* Custom Training Rules List */}
-            <div className="space-y-3 pt-2">
-              <div className="text-xs font-bold uppercase tracking-wider text-stone-500">
-                Active Custom AI Training Rules (
-                {adminState?.customTrainingRules?.length || 0})
-              </div>
-              <div className="space-y-2">
-                {(adminState?.customTrainingRules || []).map((rule, idx) => (
-                  <div
-                    key={`${idx}-${rule.slice(0, 18)}`}
-                    className="p-3 rounded-2xl liquid-glass-subtle flex items-center justify-between gap-3 text-xs"
-                  >
-                    <span className="text-stone-800">{rule}</span>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const filtered = (
-                          adminState?.customTrainingRules || []
-                        ).filter((_, i) => i !== idx);
-                        handleUpdateAdminConfig(
-                          { customTrainingRules: filtered },
-                          'Removed training rule.'
-                        );
-                      }}
-                      className="p-1.5 rounded-lg hover:bg-stone-200 text-stone-500 hover:text-red-600 shrink-0"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-                ))}
+          <div className="space-y-4">
+            {/* Universal Live Broadcast Banner Control */}
+            <div className="liquid-glass rounded-[28px] p-4 sm:p-6 space-y-3">
+              <div className="flex items-center justify-between gap-2 border-b border-stone-200/80 pb-3">
+                <div>
+                  <h2 className="text-base sm:text-lg font-bold font-display flex items-center gap-2">
+                    <Megaphone className="w-5 h-5 text-amber-600" />
+                    <span>Universal Live Broadcast Banner (Shows on Every User Screen)</span>
+                  </h2>
+                  <p className="text-xs text-stone-600">
+                    Broadcast any announcement, maintenance alert, or live message across all open public browsers in real time.
+                  </p>
+                </div>
               </div>
 
-              <form
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  if (!newRuleText.trim()) return;
-                  const nextRules = [
-                    ...(adminState?.customTrainingRules || []),
-                    newRuleText.trim(),
-                  ];
-                  setNewRuleText('');
-                  handleUpdateAdminConfig(
-                    { customTrainingRules: nextRules },
-                    'Added new permanent AI training rule!'
-                  );
-                }}
-                className="flex items-center gap-2"
-              >
+              <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
                 <input
                   type="text"
-                  value={newRuleText}
-                  onChange={(e) => setNewRuleText(e.target.value)}
-                  placeholder="Add a new permanent training rule or custom fact for GOT Agent..."
-                  className="flex-1 min-h-[42px] px-3.5 rounded-xl bg-white/80 text-xs border border-stone-300/80"
+                  value={universalBannerInput}
+                  onChange={(e) => setUniversalBannerInput(e.target.value)}
+                  placeholder="Enter universal banner text (e.g. '🚀 GOT Agent Live World Search is now active for all users!')..."
+                  className="flex-1 min-h-[42px] px-3.5 rounded-xl bg-white/85 text-xs border border-stone-300/80"
                 />
                 <button
-                  type="submit"
+                  type="button"
+                  onClick={() =>
+                    handleUpdateAdminConfig(
+                      {
+                        universalAnnouncement: {
+                          enabled: Boolean(universalBannerInput.trim()),
+                          message: universalBannerInput.trim(),
+                          badgeText: 'ADMIN LIVE BROADCAST',
+                        },
+                      },
+                      universalBannerInput.trim()
+                        ? '📢 Broadcasted Universal Banner to all connected users!'
+                        : 'Cleared Universal Banner.'
+                    )
+                  }
                   className="min-h-[42px] px-4 rounded-xl bg-stone-900 text-white text-xs font-semibold"
                 >
-                  Add Training Rule
+                  Publish Universal Banner
                 </button>
-              </form>
+                {adminState?.universalAnnouncement?.enabled && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setUniversalBannerInput('');
+                      handleUpdateAdminConfig(
+                        {
+                          universalAnnouncement: {
+                            enabled: false,
+                            message: '',
+                            badgeText: 'ADMIN LIVE BROADCAST',
+                          },
+                        },
+                        'Cleared Universal Banner.'
+                      );
+                    }}
+                    className="min-h-[42px] px-3.5 rounded-xl bg-red-600 text-white text-xs font-semibold"
+                  >
+                    Turn Off
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Google SEO & Search Metadata Manager */}
+            <div className="liquid-glass rounded-[28px] p-4 sm:p-6 space-y-3">
+              <div className="border-b border-stone-200/80 pb-3">
+                <h2 className="text-base sm:text-lg font-bold font-display flex items-center gap-2">
+                  <Globe className="w-5 h-5 text-emerald-600" />
+                  <span>Google SEO & Search Engine Metadata Manager</span>
+                </h2>
+                <p className="text-xs text-stone-600">
+                  Update the live Google Search title, meta description, and keywords for the public website (`/robots.txt`, `/sitemap.xml`, and JSON-LD Schema.org are active).
+                </p>
+              </div>
+
+              <div className="space-y-2.5 text-xs">
+                <div>
+                  <label className="font-semibold block mb-1">
+                    Website Title (`&lt;title&gt;` &amp; `og:title`)
+                  </label>
+                  <input
+                    type="text"
+                    value={seoTitleInput}
+                    onChange={(e) => setSeoTitleInput(e.target.value)}
+                    className="w-full min-h-[40px] px-3.5 rounded-xl bg-white/85 border border-stone-300/80"
+                  />
+                </div>
+                <div>
+                  <label className="font-semibold block mb-1">
+                    Google Meta Description (`description` &amp; `og:description`)
+                  </label>
+                  <input
+                    type="text"
+                    value={seoDescInput}
+                    onChange={(e) => setSeoDescInput(e.target.value)}
+                    className="w-full min-h-[40px] px-3.5 rounded-xl bg-white/85 border border-stone-300/80"
+                  />
+                </div>
+                <div>
+                  <label className="font-semibold block mb-1">
+                    Google Search Keywords
+                  </label>
+                  <input
+                    type="text"
+                    value={seoKeywordsInput}
+                    onChange={(e) => setSeoKeywordsInput(e.target.value)}
+                    className="w-full min-h-[40px] px-3.5 rounded-xl bg-white/85 border border-stone-300/80"
+                  />
+                </div>
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleUpdateAdminConfig(
+                      {
+                        seoConfig: {
+                          title: seoTitleInput.trim(),
+                          description: seoDescInput.trim(),
+                          keywords: seoKeywordsInput.trim(),
+                        },
+                      },
+                      '🔍 Updated Google SEO Title, Description & Keywords universally!'
+                    )
+                  }
+                  className="min-h-[40px] px-5 rounded-xl bg-stone-900 text-white font-semibold"
+                >
+                  Save &amp; Publish Google SEO Metadata
+                </button>
+              </div>
+            </div>
+
+            <div className="liquid-glass rounded-[28px] p-4 sm:p-6 space-y-5">
+              <div className="border-b border-stone-200/80 pb-3.5">
+                <h2 className="text-base sm:text-lg font-bold font-display">
+                  Self-Upgraded AI Modules &amp; Custom Training Knowledge
+                </h2>
+                <p className="text-xs text-stone-600">
+                  Toggle active capabilities on the public website or manage custom instructions taught to GOT Agent.
+                </p>
+              </div>
+
+              {/* Module Toggles */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
+                {[
+                  {
+                    key: 'imageGenerator',
+                    label: 'AI Image Generator',
+                    desc: 'Generates visual SVG/Canvas artwork inside public chat',
+                  },
+                  {
+                    key: 'codeGenerator',
+                    label: 'AI Code Studio',
+                    desc: 'Interactive code blocks with live HTML preview',
+                  },
+                  {
+                    key: 'voiceConversation',
+                    label: 'Real-Time Input Voice',
+                    desc: 'Live mic & speech synthesis inside input bar',
+                  },
+                  {
+                    key: 'googleSearch',
+                    label: 'Live Background Google Search',
+                    desc: 'Real-time world search & URL grounding',
+                  },
+                  {
+                    key: 'visionOcr',
+                    label: 'Image Vision OCR',
+                    desc: 'Direct photo upload & text/object inspection',
+                  },
+                ].map((mod) => {
+                  const isEnabled = Boolean(
+                    (adminState?.enabledModules as any)?.[mod.key] ?? true
+                  );
+                  return (
+                    <div
+                      key={mod.key}
+                      className="p-3.5 rounded-2xl liquid-glass-subtle border border-white/90 flex items-center justify-between gap-3"
+                    >
+                      <div>
+                        <div className="text-xs font-bold text-stone-900">
+                          {mod.label}
+                        </div>
+                        <div className="text-[11px] text-stone-500">
+                          {mod.desc}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          handleUpdateAdminConfig(
+                            {
+                              enabledModules: {
+                                [mod.key]: !isEnabled,
+                              },
+                            },
+                            `${mod.label} ${!isEnabled ? 'Enabled' : 'Disabled'} universally!`
+                          )
+                        }
+                        className={`min-h-[34px] px-3 rounded-xl text-xs font-semibold ${
+                          isEnabled
+                            ? 'bg-emerald-600 text-white'
+                            : 'bg-stone-300 text-stone-700'
+                        }`}
+                      >
+                        {isEnabled ? 'ON' : 'OFF'}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Custom Training Rules List */}
+              <div className="space-y-3 pt-2">
+                <div className="text-xs font-bold uppercase tracking-wider text-stone-500">
+                  Active Custom AI Training Rules (
+                  {adminState?.customTrainingRules?.length || 0})
+                </div>
+                <div className="space-y-2">
+                  {(adminState?.customTrainingRules || []).map((rule, idx) => (
+                    <div
+                      key={`${idx}-${rule.slice(0, 18)}`}
+                      className="p-3 rounded-2xl liquid-glass-subtle flex items-center justify-between gap-3 text-xs"
+                    >
+                      <span className="text-stone-800">{rule}</span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const filtered = (
+                            adminState?.customTrainingRules || []
+                          ).filter((_, i) => i !== idx);
+                          handleUpdateAdminConfig(
+                            { customTrainingRules: filtered },
+                            'Removed training rule.'
+                          );
+                        }}
+                        className="p-1.5 rounded-lg hover:bg-stone-200 text-stone-500 hover:text-red-600 shrink-0"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    if (!newRuleText.trim()) return;
+                    const nextRules = [
+                      ...(adminState?.customTrainingRules || []),
+                      newRuleText.trim(),
+                    ];
+                    setNewRuleText('');
+                    handleUpdateAdminConfig(
+                      { customTrainingRules: nextRules },
+                      'Added new permanent AI training rule universally!'
+                    );
+                  }}
+                  className="flex items-center gap-2"
+                >
+                  <input
+                    type="text"
+                    value={newRuleText}
+                    onChange={(e) => setNewRuleText(e.target.value)}
+                    placeholder="Add a new permanent training rule or custom fact for GOT Agent..."
+                    className="flex-1 min-h-[42px] px-3.5 rounded-xl bg-white/80 text-xs border border-stone-300/80"
+                  />
+                  <button
+                    type="submit"
+                    className="min-h-[42px] px-4 rounded-xl bg-stone-900 text-white text-xs font-semibold"
+                  >
+                    Add Training Rule
+                  </button>
+                </form>
+              </div>
             </div>
           </div>
         )}
@@ -3442,6 +4010,26 @@ export default function App() {
       }
     } catch {}
 
+    // Universal Real-Time Server-Sent Events (SSE) Push Stream from /GOTadmin
+    let es: EventSource | null = null;
+    try {
+      if (typeof EventSource !== 'undefined') {
+        es = new EventSource('/api/public/live-stream');
+        es.onmessage = (event) => {
+          try {
+            const pushedConfig = JSON.parse(event.data);
+            if (pushedConfig && typeof pushedConfig === 'object') {
+              setPublicConfig((prev) => ({ ...prev, ...pushedConfig }));
+              window.localStorage.setItem(
+                PUBLIC_CONFIG_CACHE_KEY,
+                JSON.stringify(pushedConfig)
+              );
+            }
+          } catch {}
+        };
+      }
+    } catch {}
+
     return () => {
       clearInterval(interval);
       window.removeEventListener('focus', handleFocus);
@@ -3449,8 +4037,32 @@ export default function App() {
       try {
         bc?.close();
       } catch {}
+      try {
+        es?.close();
+      } catch {}
     };
   }, [fetchPublicSiteConfig]);
+
+  // Dynamically sync Google SEO <title> and <meta> tags when Admin updates SEO universally
+  useEffect(() => {
+    if (typeof document === 'undefined' || !publicConfig.seoConfig) return;
+    const nextTitle =
+      publicConfig.seoConfig.siteTitle || publicConfig.seoConfig.title;
+    if (nextTitle) {
+      document.title = nextTitle;
+    }
+    const descMeta = document.querySelector('meta[name="description"]');
+    const nextDesc =
+      publicConfig.seoConfig.metaDescription ||
+      publicConfig.seoConfig.description;
+    if (descMeta && nextDesc) {
+      descMeta.setAttribute('content', nextDesc);
+    }
+    const kwMeta = document.querySelector('meta[name="keywords"]');
+    if (kwMeta && publicConfig.seoConfig.keywords) {
+      kwMeta.setAttribute('content', publicConfig.seoConfig.keywords);
+    }
+  }, [publicConfig.seoConfig]);
 
   useEffect(() => {
     const handleLocationChange = () => {
@@ -3827,6 +4439,12 @@ export default function App() {
       role: 'user',
       isBlocked: false,
       violentChatCount: 0,
+      tokenBalance:
+        typeof localAdmin.defaultUserTokens === 'number'
+          ? localAdmin.defaultUserTokens
+          : 5000,
+      totalTokensUsed: 0,
+      unlimitedTokens: false,
       createdAt: new Date().toISOString(),
       lastLoginAt: new Date().toISOString(),
       savedSessions: sessions.map((s) => ({
@@ -4398,7 +5016,8 @@ export default function App() {
 
     const controller = new AbortController();
     activeAbortRef.current = controller;
-    const timeoutId = setTimeout(() => controller.abort(), 25000);
+    // 60-second client timeout so large, complex, or multi-part questions never truncate or abort early
+    const timeoutId = setTimeout(() => controller.abort(), 60000);
 
     const targetSessionId = activeSession.id;
 
@@ -4479,7 +5098,7 @@ export default function App() {
             currentUserId: currentUser?.id,
             currentUserName: currentUser?.name,
             currentUserEmail: currentUser?.email,
-            history: updatedHistory.slice(-6).map((m) => ({
+            history: updatedHistory.slice(-10).map((m) => ({
               role: m.role,
               text: m.text,
             })),
@@ -4509,11 +5128,12 @@ export default function App() {
         data = await runStaticHostClientChat({
           message: effectiveText,
           agentMode,
+          useGoogleSearch,
           imageBase64: base64Data,
           imageMimeType: currentImgMime,
           pastSessionsSummary,
           currentUser,
-          history: updatedHistory.slice(-6).map((m) => ({
+          history: updatedHistory.slice(-10).map((m) => ({
             role: m.role,
             text: m.text,
           })),
@@ -4532,6 +5152,21 @@ export default function App() {
         return;
       }
 
+      if (typeof data?.tokenBalance === 'number') {
+        setCurrentUser((prev) =>
+          prev
+            ? {
+                ...prev,
+                tokenBalance: data.tokenBalance,
+                unlimitedTokens:
+                  typeof data.unlimitedTokens === 'boolean'
+                    ? data.unlimitedTokens
+                    : prev.unlimitedTokens,
+              }
+            : prev
+        );
+      }
+
       const replyText = data.reply || 'Here is your response from GOT Agent.';
 
       const agentMsg: GotChatMessage = {
@@ -4547,6 +5182,9 @@ export default function App() {
         highlights: data.highlights || [],
         visionSummary: data.visionSummary || '',
         sources: Array.isArray(data.sources) ? data.sources : [],
+        searchQueriesAnalyzed: Array.isArray(data.searchQueriesAnalyzed)
+          ? data.searchQueriesAnalyzed
+          : [],
         followUpPrompts: data.followUpPrompts || [],
       };
 
@@ -4922,6 +5560,23 @@ export default function App() {
           </div>
         )}
 
+      {/* Universal Admin Live Announcement Banner (Broadcast Instantly to All Connected Browsers) */}
+      {publicConfig.universalAnnouncement?.enabled &&
+        publicConfig.universalAnnouncement.message && (
+          <div
+            className={`relative z-30 px-4 py-2 text-xs sm:text-sm font-semibold text-center flex items-center justify-center gap-2 shadow-sm ${
+              publicConfig.universalAnnouncement.style === 'emerald'
+                ? 'bg-emerald-700 text-white'
+                : publicConfig.universalAnnouncement.style === 'royal'
+                  ? 'bg-stone-900 text-amber-200'
+                  : 'bg-gradient-to-r from-amber-600 via-orange-600 to-amber-600 text-white'
+            }`}
+          >
+            <Megaphone className="w-4 h-4 shrink-0" />
+            <span>{publicConfig.universalAnnouncement.message}</span>
+          </div>
+        )}
+
       {/* Official Co-Admin Announcement Banner (When Admin promotes a Co-Admin) */}
       {Array.isArray(publicConfig.coAdminAnnouncements) &&
         publicConfig.coAdminAnnouncements.length > 0 && (
@@ -5002,8 +5657,8 @@ export default function App() {
           </button>
         </nav>
 
-        {/* Zone 3: User Portal Badge + Co-Admin Shortcut + New Chat */}
-        <div className="flex items-center gap-2 shrink-0">
+        {/* Zone 3: User Token Balance + User Portal Badge + Co-Admin Shortcut + New Chat */}
+        <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
           {currentUser?.role === 'co-admin' && (
             <button
               type="button"
@@ -5011,31 +5666,56 @@ export default function App() {
                 window.history.pushState({}, '', '/GOTadmin');
                 setIsGotAdminRoute(true);
               }}
-              className="min-h-[38px] px-3 py-1.5 rounded-2xl bg-amber-500/20 text-amber-950 dark:text-amber-200 text-xs font-bold flex items-center gap-1.5 border border-amber-500/40"
+              className="min-h-[38px] px-2.5 sm:px-3 py-1.5 rounded-2xl bg-amber-500/20 text-amber-950 dark:text-amber-200 text-xs font-bold flex items-center gap-1.5 border border-amber-500/40"
               title="Open Co-Admin Dashboard"
             >
               <Crown className="w-3.5 h-3.5 text-amber-600" />
-              <span className="hidden sm:inline">Co-Admin Panel</span>
+              <span className="hidden sm:inline">Co-Admin</span>
             </button>
           )}
+
+          {/* User Live Token Balance Badge */}
+          <div
+            title={
+              currentUser?.unlimitedTokens || currentUser?.role === 'co-admin'
+                ? 'Unlimited AI Tokens Granted by Admin Abhinav'
+                : `Remaining AI Tokens: ${(currentUser?.tokenBalance ?? 5000).toLocaleString()} (Admin can grant more tokens anytime)`
+            }
+            className={`min-h-[38px] px-2.5 py-1.5 rounded-2xl text-xs font-mono font-bold flex items-center gap-1 border ${
+              currentUser?.unlimitedTokens || currentUser?.role === 'co-admin'
+                ? 'bg-amber-500/15 text-amber-900 dark:text-amber-300 border-amber-500/35'
+                : (currentUser?.tokenBalance ?? 5000) <= 300
+                  ? 'bg-red-500/15 text-red-700 dark:text-red-300 border-red-500/35'
+                  : 'liquid-glass-subtle text-emerald-800 dark:text-emerald-300 border-emerald-500/25'
+            }`}
+          >
+            <Zap className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+            <span>
+              {currentUser?.unlimitedTokens || currentUser?.role === 'co-admin'
+                ? '♾️ Tokens'
+                : `${(currentUser?.tokenBalance ?? 5000).toLocaleString()}`}
+            </span>
+          </div>
 
           <button
             type="button"
             onClick={() => setShowSwitchAccountModal(true)}
-            className="min-h-[38px] px-3 py-1.5 rounded-2xl liquid-glass-subtle text-xs font-semibold text-stone-800 dark:text-stone-200 flex items-center gap-1.5"
+            className="min-h-[38px] px-2.5 sm:px-3 py-1.5 rounded-2xl liquid-glass-subtle text-xs font-semibold text-stone-800 dark:text-stone-200 flex items-center gap-1.5"
             title={`Signed in as ${currentUser.name} (${currentUser.email}) · IP: ${clientIp}`}
           >
             <UserCheck className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-            <span className="max-w-[96px] truncate">{currentUser.name}</span>
+            <span className="max-w-[82px] sm:max-w-[96px] truncate">
+              {currentUser.name}
+            </span>
           </button>
 
           <button
             type="button"
             onClick={handleStartNewChat}
-            className={`min-h-[40px] px-3.5 sm:px-4 py-2 rounded-2xl bg-stone-900 text-stone-50 dark:bg-stone-100 dark:text-stone-950 text-xs font-semibold ${festivalHoverClass} whitespace-nowrap shrink-0 flex items-center gap-1.5`}
+            className={`min-h-[40px] px-3 sm:px-4 py-2 rounded-2xl bg-stone-900 text-stone-50 dark:bg-stone-100 dark:text-stone-950 text-xs font-semibold ${festivalHoverClass} whitespace-nowrap shrink-0 flex items-center gap-1.5`}
           >
             <Plus className="w-3.5 h-3.5" />
-            New Chat
+            <span className="hidden xs:inline">New Chat</span>
           </button>
         </div>
       </header>
@@ -5685,29 +6365,53 @@ export default function App() {
                           </div>
                         )}
 
-                        {/* Grounded Google Search Citations & Web Links */}
-                        {msg.sources && msg.sources.length > 0 && (
-                          <div className="p-3 rounded-2xl liquid-glass-subtle space-y-2">
-                            <div className="flex items-center gap-1.5 text-xs font-semibold text-stone-800 dark:text-stone-200">
-                              <Globe className="w-3.5 h-3.5" />
-                              Google Search Grounded Sources
+                        {/* Real-Time World Connected & Background Google Search Analysis */}
+                        {((msg.sources && msg.sources.length > 0) ||
+                          (msg.searchQueriesAnalyzed &&
+                            msg.searchQueriesAnalyzed.length > 0)) && (
+                          <div className="p-3 rounded-2xl liquid-glass-subtle space-y-2.5">
+                            <div className="flex items-center justify-between gap-2 flex-wrap">
+                              <div className="flex items-center gap-1.5 text-xs font-semibold text-stone-800 dark:text-stone-200">
+                                <Globe className="w-3.5 h-3.5 text-emerald-600" />
+                                <span>
+                                  Real-Time Google & Live Web Grounded Analysis
+                                </span>
+                              </div>
+                              {msg.searchQueriesAnalyzed &&
+                                msg.searchQueriesAnalyzed.length > 0 && (
+                                  <div className="flex items-center gap-1 flex-wrap">
+                                    {msg.searchQueriesAnalyzed
+                                      .slice(0, 3)
+                                      .map((q, qi) => (
+                                        <span
+                                          key={`sq-${qi}`}
+                                          className="px-2 py-0.5 rounded-lg bg-stone-900/10 dark:bg-stone-800 text-[10px] font-mono text-stone-700 dark:text-stone-300 flex items-center gap-1"
+                                        >
+                                          <Search className="w-2.5 h-2.5 opacity-70" />
+                                          {q}
+                                        </span>
+                                      ))}
+                                  </div>
+                                )}
                             </div>
-                            <div className="flex flex-wrap gap-2">
-                              {msg.sources.map((src, idx) => (
-                                <a
-                                  key={`${src.uri}-${idx}`}
-                                  href={src.uri}
-                                  target="_blank"
-                                  rel="noopener noreferrer"
-                                  className={`min-h-[36px] px-3 py-1.5 rounded-xl bg-white/80 dark:bg-stone-900/80 border border-white/90 dark:border-stone-800 text-xs font-medium text-stone-800 dark:text-stone-200 flex items-center gap-1.5 ${festivalHoverClass} max-w-full`}
-                                >
-                                  <span className="truncate max-w-[210px]">
-                                    {src.title}
-                                  </span>
-                                  <ExternalLink className="w-3 h-3 opacity-60 shrink-0" />
-                                </a>
-                              ))}
-                            </div>
+                            {msg.sources && msg.sources.length > 0 && (
+                              <div className="flex flex-wrap gap-2">
+                                {msg.sources.map((src, idx) => (
+                                  <a
+                                    key={`${src.uri}-${idx}`}
+                                    href={src.uri}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className={`min-h-[36px] px-3 py-1.5 rounded-xl bg-white/80 dark:bg-stone-900/80 border border-white/90 dark:border-stone-800 text-xs font-medium text-stone-800 dark:text-stone-200 flex items-center gap-1.5 ${festivalHoverClass} max-w-full`}
+                                  >
+                                    <span className="truncate max-w-[210px]">
+                                      {src.title}
+                                    </span>
+                                    <ExternalLink className="w-3 h-3 opacity-60 shrink-0" />
+                                  </a>
+                                ))}
+                              </div>
+                            )}
                           </div>
                         )}
 
