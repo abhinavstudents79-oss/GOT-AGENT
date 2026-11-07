@@ -1,0 +1,5 @@
+/GOTadmin /index.html 200
+/gotadmin /index.html 200
+/GOTadmin/* /index.html 200
+/gotadmin/* /index.html 200
+/* /index.html 200

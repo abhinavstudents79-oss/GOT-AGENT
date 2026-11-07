@@ -1,0 +1,7 @@
+{
+  "rewrites": [
+    { "source": "/GOTadmin", "destination": "/index.html" },
+    { "source": "/gotadmin", "destination": "/index.html" },
+    { "source": "/(.*)", "destination": "/index.html" }
+  ]
+}
