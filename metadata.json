@@ -1,0 +1,6 @@
+{
+  "name": "Strata Decision Agent",
+  "description": "Mobile-first AI decision agent for analyzing complex multi-dimensional datasets, detecting anomalies, and automating threshold-based operational workflows.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
