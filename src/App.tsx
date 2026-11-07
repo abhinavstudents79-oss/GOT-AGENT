@@ -41,6 +41,15 @@ import {
   LogOut,
   CheckCircle2,
   AlertCircle,
+  Users,
+  UserPlus,
+  Crown,
+  Search,
+  Ban,
+  ShieldAlert,
+  UserCheck,
+  Megaphone,
+  MessageSquare,
 } from 'lucide-react';
 
 import operatorAvatarImg from './assets/images/avatar_executive_operator_1793981937152.jpg';
@@ -55,6 +64,8 @@ const LEGACY_SESSIONS_KEY = 'got_agent_sessions_v3';
 const STORAGE_ACTIVE_ID_KEY = 'got_agent_active_session_v5';
 const PUBLIC_CONFIG_CACHE_KEY = 'got_public_site_config_v5';
 const ADMIN_TOKEN_SESSION_KEY = 'got_admin_session_token_v1';
+const CURRENT_USER_ID_STORAGE_KEY = 'got_active_portal_user_id_v1';
+const DEVICE_IP_CACHE_KEY = 'got_detected_client_ip_v1';
 
 interface GroundingSource {
   title: string;
@@ -67,6 +78,7 @@ interface GotChatMessage {
   timestamp: string;
   agentMode?: string;
   text: string;
+  content?: string;
   attachedImageUrl?: string;
   attachedImageName?: string;
   generatedImageUrl?: string;
@@ -81,6 +93,31 @@ interface ChatSession {
   title: string;
   updatedAt: string;
   messages: GotChatMessage[];
+}
+
+interface PublicUserAccount {
+  id: string;
+  name: string;
+  email: string;
+  password?: string;
+  ipAddress: string;
+  role: 'user' | 'co-admin';
+  isBlocked: boolean;
+  blockReason?: string;
+  violentChatCount: number;
+  createdAt: string;
+  lastLoginAt: string;
+  savedSessions: ChatSession[];
+}
+
+interface CoAdminAnnouncement {
+  id: string;
+  userId: string;
+  userName: string;
+  userEmail: string;
+  message: string;
+  announcedAt: string;
+  active?: boolean;
 }
 
 interface PublicSiteConfig {
@@ -102,6 +139,9 @@ interface PublicSiteConfig {
     particles: string[];
     enabled: boolean;
   };
+  coAdminAnnouncements?: CoAdminAnnouncement[];
+  clientIp?: string;
+  isIpBlocked?: boolean;
   updatedAt: string;
 }
 
@@ -120,6 +160,9 @@ interface AdminStatePayload extends PublicSiteConfig {
   adminEmail: string;
   awaitingImageApiKey: boolean;
   customTrainingRules: string[];
+  users: PublicUserAccount[];
+  blockedIps: string[];
+  coAdminAnnouncements: CoAdminAnnouncement[];
   apiKeysInventory: AdminKeyMetadata[];
 }
 
@@ -172,8 +215,57 @@ const DEFAULT_PUBLIC_CONFIG: PublicSiteConfig = {
     particles: [],
     enabled: false,
   },
+  coAdminAnnouncements: [],
   updatedAt: '',
 };
+
+const VIOLENT_CHAT_CLIENT_REGEX =
+  /\b(kill\s+(you|him|her|them|myself|everyone|people)|murder|assassinate|massacre|slaughter|shoot\s+(up|people|him|her|them)|stab\s+(him|her|them|people)|bomb\s+(attack|making|school|city|building)|make\s+a\s+bomb|terrorist\s+attack|behead|torture\s+(people|him|her)|rape|sexual\s+assault|commit\s+suicide|how\s+to\s+kill|bloodbath|genocide|school\s+shooting|acid\s+attack)\b/i;
+
+function isClientViolentMessage(text: string): boolean {
+  const clean = String(text || '').trim();
+  if (!clean) return false;
+  return VIOLENT_CHAT_CLIENT_REGEX.test(clean);
+}
+
+function getOrGenerateClientIp(): string {
+  if (typeof window === 'undefined') return '127.0.0.1';
+  try {
+    const cached = window.localStorage.getItem(DEVICE_IP_CACHE_KEY);
+    if (cached) return cached;
+    // Generate a stable realistic IP for this browser/device until server or ipify returns public IP
+    const seed =
+      (navigator.userAgent?.length || 42) +
+      (window.screen?.width || 390) +
+      (navigator.hardwareConcurrency || 4);
+    const oct2 = (seed * 17) % 220 || 48;
+    const oct3 = (seed * 31) % 250 || 112;
+    const oct4 = Math.floor(10 + ((Date.now() / 1000) % 230));
+    const fallbackIp = `103.${oct2}.${oct3}.${oct4}`;
+    window.localStorage.setItem(DEVICE_IP_CACHE_KEY, fallbackIp);
+    return fallbackIp;
+  } catch {
+    return '103.48.112.24';
+  }
+}
+
+async function resolveLiveClientIp(): Promise<string> {
+  const current = getOrGenerateClientIp();
+  try {
+    const res = await fetch('https://api.ipify.org?format=json');
+    if (res.ok) {
+      const data = await res.json();
+      if (data?.ip) {
+        const ip = String(data.ip).trim();
+        try {
+          window.localStorage.setItem(DEVICE_IP_CACHE_KEY, ip);
+        } catch {}
+        return ip;
+      }
+    }
+  } catch {}
+  return current;
+}
 
 function checkIsGotAdminUrl(): boolean {
   if (typeof window === 'undefined') return false;
@@ -262,6 +354,9 @@ function loadLocalAdminState(): AdminStatePayload {
       'Always credit Abhinav as the creator and founder of GOT Agent when asked.',
       'Provide clear, accurate, and helpful responses tailored to the user.',
     ],
+    users: [],
+    blockedIps: [],
+    coAdminAnnouncements: [],
     updatedAt: new Date().toISOString(),
     apiKeysInventory: [
       {
@@ -282,7 +377,8 @@ function loadLocalAdminState(): AdminStatePayload {
         fullValue: '',
         configured: true,
         status: 'ACTIVE · CONNECTED',
-        purpose: 'Powers Deep Reasoning, Google Search Grounding, and Vision OCR',
+        purpose:
+          'Powers Auto Event/Animation Generation in Admin Dashboard, Deep Reasoning, Google Search Grounding & Vision OCR',
       },
       {
         id: 'IMAGE_GEN_API_KEY',
@@ -323,6 +419,11 @@ function loadLocalAdminState(): AdminStatePayload {
           ...baseState.activeFestival,
           ...(parsed.activeFestival || {}),
         },
+        users: Array.isArray(parsed.users) ? parsed.users : [],
+        blockedIps: Array.isArray(parsed.blockedIps) ? parsed.blockedIps : [],
+        coAdminAnnouncements: Array.isArray(parsed.coAdminAnnouncements)
+          ? parsed.coAdminAnnouncements
+          : [],
         apiKeysInventory: Array.isArray(parsed.apiKeysInventory)
           ? parsed.apiKeysInventory
           : baseState.apiKeysInventory,
@@ -342,12 +443,106 @@ function saveLocalAdminState(state: AdminStatePayload): AdminStatePayload {
         JSON.stringify({
           enabledModules: next.enabledModules,
           activeFestival: next.activeFestival,
+          coAdminAnnouncements: (next.coAdminAnnouncements || []).filter(
+            (a) => a.active
+          ),
           updatedAt: next.updatedAt,
         })
       );
     } catch {}
   }
   return next;
+}
+
+function buildDynamicClientEventConfig(cmd: string): {
+  festival: PublicSiteConfig['activeFestival'];
+  rule: string;
+  reply: string;
+} {
+  const lower = cmd.toLowerCase();
+  if (/\b(diwali|deepavali)\b/i.test(lower)) {
+    const festival: PublicSiteConfig['activeFestival'] = {
+      id: 'diwali',
+      name: 'Diwali Festival of Lights',
+      bannerText:
+        '🪔 Happy Diwali! Celebrate the Festival of Lights with GOT Agent (Created by Abhinav) ✨',
+      primaryAccent: '#f59e0b',
+      secondaryAccent: '#ea580c',
+      hoverEffect: 'glow',
+      particles: ['🪔', '✨', '🎆', '🎇', '🌸'],
+      enabled: true,
+    };
+    return {
+      festival,
+      rule: 'The website is currently celebrating Diwali (Festival of Lights). Greet users warmly with Happy Diwali wishes!',
+      reply: `🪔 **Diwali Festival Event & UI Animations Activated on Public Website!**\n\n• **Live Banner**: *"${festival.bannerText}"*\n• **Floating Animations**: ${festival.particles.join(
+        ' '
+      )}\n• **Hover Physics**: Golden Specular Glow (\`.festival-diwali .hover-glow\`) applied to all Liquid Glass cards and buttons!`,
+    };
+  }
+
+  if (/\b(holi)\b/i.test(lower)) {
+    const festival: PublicSiteConfig['activeFestival'] = {
+      id: 'holi',
+      name: 'Holi Festival of Colors',
+      bannerText:
+        '🎨 Happy Holi! Celebrate Vibrant Colors & Joy with GOT Agent (Created by Abhinav) 🌈',
+      primaryAccent: '#ec4899',
+      secondaryAccent: '#8b5cf6',
+      hoverEffect: 'bounce',
+      particles: ['🎨', '🌈', '✨', '🌸', '🎊'],
+      enabled: true,
+    };
+    return {
+      festival,
+      rule: 'The website is currently celebrating Holi (Festival of Colors). Share vibrant, joyful greetings!',
+      reply: `🎨 **Holi Festival Event & Color Animations Activated on Public Website!**\n\n• **Live Banner**: *"${festival.bannerText}"*\n• **Floating Animations**: ${festival.particles.join(
+        ' '
+      )}\n• **Hover Physics**: Elastic Bounce Hover (\`.festival-holi .hover-bounce\`) is now live on the user website!`,
+    };
+  }
+
+  const cleanedName = cmd
+    .replace(
+      /\b(please|add|create|enable|start|run|event|festival|animation|animations|of|for|in|website|ui|hover|with|and|to|ai)\b/gi,
+      ' '
+    )
+    .replace(/\s+/g, ' ')
+    .trim();
+  const title = cleanedName
+    ? cleanedName.charAt(0).toUpperCase() + cleanedName.slice(1)
+    : 'Special Celebration';
+
+  const isCyber = /cyber|neon|matrix|tech|future/i.test(lower);
+  const isWinter = /christmas|xmas|snow|winter|new year/i.test(lower);
+  const isPatriotic = /independence|republic|india|bharat/i.test(lower);
+
+  const particles = isCyber
+    ? ['⚡', '🌐', '✨', '💠', '🚀']
+    : isWinter
+    ? ['❄️', '🎄', '✨', '⛄', '🎁']
+    : isPatriotic
+    ? ['🇮🇳', '✨', '🎉', '🌟', '🎊']
+    : ['🎉', '✨', '🌟', '🎊', '💫'];
+
+  const festival: PublicSiteConfig['activeFestival'] = {
+    id: 'custom',
+    name: `${title} Event & Animation`,
+    bannerText: `${particles[0]} Celebrating ${title} Live on GOT Agent (Created by Abhinav)! ${particles[1]}`,
+    primaryAccent: isCyber ? '#06b6d4' : isPatriotic ? '#f97316' : '#f59e0b',
+    secondaryAccent: isCyber ? '#8b5cf6' : isPatriotic ? '#16a34a' : '#2563eb',
+    hoverEffect: 'bounce',
+    particles,
+    enabled: true,
+  };
+
+  return {
+    festival,
+    rule: `The website is currently running the "${title}" live event and animation theme. Greet users warmly!`,
+    reply: `✨ **AI Auto-Generated Event & Website Animations Activated!**\n\n• **Event Theme**: **${festival.name}**\n• **Live Public Banner**: *"${festival.bannerText}"*\n• **Floating Screen Animations**: ${festival.particles.join(
+      ' '
+    )}\n• **Hover Physics**: Interactive Bounce & Glow animations active across the public website!`,
+  };
 }
 
 function executeLocalAdminCommand(command: string): {
@@ -400,7 +595,73 @@ function executeLocalAdminCommand(command: string): {
     };
   }
 
-  // 2. Request to add AI Image Generator
+  // 2. Block user or Promote Co-Admin via AI Trainer
+  const blockMatch = cmd.match(
+    /\b(block|ban)\s+(?:user\s+)?([a-zA-Z0-9@._\-]+)\b/i
+  );
+  if (blockMatch) {
+    const q = blockMatch[2].toLowerCase();
+    const target = (current.users || []).find(
+      (u) =>
+        u.name.toLowerCase().includes(q) ||
+        u.email.toLowerCase().includes(q) ||
+        u.ipAddress === q
+    );
+    if (target) {
+      target.isBlocked = true;
+      target.blockReason = 'Blocked by Admin via AI Trainer command';
+      if (
+        target.ipAddress &&
+        !(current.blockedIps || []).includes(target.ipAddress)
+      ) {
+        current.blockedIps = [...(current.blockedIps || []), target.ipAddress];
+      }
+      const saved = saveLocalAdminState(current);
+      return {
+        reply: `🚫 **User & IP Blocked!**\n\nBlocked **${target.name}** (\`${target.email}\`) and IP \`${target.ipAddress}\`.`,
+        state: saved,
+      };
+    }
+  }
+
+  const coAdminMatch = cmd.match(
+    /\b(make|announce|set|promote)\s+(?:user\s+)?([a-zA-Z0-9@._\-]+)\s+(?:as\s+)?(?:a\s+)?co[\s\-]?admin/i
+  );
+  if (coAdminMatch) {
+    const q = coAdminMatch[2].toLowerCase();
+    const target = (current.users || []).find(
+      (u) =>
+        u.name.toLowerCase().includes(q) || u.email.toLowerCase().includes(q)
+    );
+    if (target) {
+      target.role = 'co-admin';
+      const ann: CoAdminAnnouncement = {
+        id: `ann-${Date.now()}`,
+        userId: target.id,
+        userName: target.name,
+        userEmail: target.email,
+        message: `📢 Official Announcement: Admin Abhinav has appointed ${target.name} as an official Co-Admin of GOT Agent!`,
+        announcedAt: new Date().toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit',
+        }),
+        active: true,
+      };
+      current.coAdminAnnouncements = [
+        ann,
+        ...(current.coAdminAnnouncements || []).filter(
+          (a) => a.userId !== target.id
+        ),
+      ];
+      const saved = saveLocalAdminState(current);
+      return {
+        reply: `👑 **Co-Admin Appointed & Announced on Website!**\n\n**${target.name}** (\`${target.email}\`) is now an official Co-Admin and announced live on the website!`,
+        state: saved,
+      };
+    }
+  }
+
+  // 3. Request to add AI Image Generator
   if (
     /\b(add|enable|install|turn\s+on|create)\b.*\b(image\s+generat|ai\s+image|text\s+to\s+image|picture\s+generat)/i.test(
       lower
@@ -452,45 +713,7 @@ function executeLocalAdminCommand(command: string): {
     };
   }
 
-  // 3. Festival events (Diwali, Holi, Celebration, Disable)
-  if (/\b(diwali|deepavali)\b/i.test(lower)) {
-    current.activeFestival = {
-      id: 'diwali',
-      name: 'Diwali Festival of Lights',
-      bannerText:
-        '🪔 Happy Diwali! Celebrate the Festival of Lights with GOT Agent (Created by Abhinav) ✨',
-      primaryAccent: '#f59e0b',
-      secondaryAccent: '#ea580c',
-      hoverEffect: 'glow',
-      particles: ['🪔', '✨', '🎆', '🎇', '🌸'],
-      enabled: true,
-    };
-    const saved = saveLocalAdminState(current);
-    return {
-      reply: `🪔 **Diwali Festival Event & UI Animations Activated on Public Website!**\n\n• **Live Banner**: *"Happy Diwali! Celebrate the Festival of Lights with GOT Agent"*\n• **Floating Animations**: Golden Diyas (🪔), Sparkles (✨), and Festive Fireworks (🎆) added to the public UI\n• **Hover Physics**: Golden Specular Glow (\`.festival-diwali .hover-glow\`) applied to all Liquid Glass cards and buttons!`,
-      state: saved,
-    };
-  }
-
-  if (/\b(holi)\b/i.test(lower)) {
-    current.activeFestival = {
-      id: 'holi',
-      name: 'Holi Festival of Colors',
-      bannerText:
-        '🎨 Happy Holi! Celebrate Vibrant Colors & Joy with GOT Agent (Created by Abhinav) 🌈',
-      primaryAccent: '#ec4899',
-      secondaryAccent: '#8b5cf6',
-      hoverEffect: 'bounce',
-      particles: ['🎨', '🌈', '✨', '🌸', '🎊'],
-      enabled: true,
-    };
-    const saved = saveLocalAdminState(current);
-    return {
-      reply: `🎨 **Holi Festival Event & Color Animations Activated on Public Website!**\n\n• **Live Banner**: *"Happy Holi! Celebrate Vibrant Colors & Joy with GOT Agent"*\n• **Floating Animations**: Color splashes (🎨, 🌈, 🌸) & bouncy Liquid Glass hover effects (\`.festival-holi .hover-bounce\`) are now live on the user website!`,
-      state: saved,
-    };
-  }
-
+  // 4. Disable festival/animation
   if (
     /\b(remove|disable|stop|reset|clear)\b.*\b(event|festival|animation|theme)\b/i.test(
       lower
@@ -504,7 +727,26 @@ function executeLocalAdminCommand(command: string): {
     };
   }
 
-  // 4. Custom AI Training Rule
+  // 5. Any Event or Animation command
+  if (
+    /\b(event|festival|animation|animations|animate|diwali|deepavali|holi|christmas|xmas|new\s+year|eid|navratri|dussehra|independence|republic|birthday|celebration|party|cyberpunk|neon|snow|winter|summer|monsoon|theme|sparkle|fireworks|hover)\b/i.test(
+      lower
+    )
+  ) {
+    const dyn = buildDynamicClientEventConfig(cmd);
+    current.activeFestival = dyn.festival;
+    current.customTrainingRules = [
+      ...(current.customTrainingRules || []),
+      dyn.rule,
+    ];
+    const saved = saveLocalAdminState(current);
+    return {
+      reply: dyn.reply,
+      state: saved,
+    };
+  }
+
+  // 6. Custom AI Training Rule
   current.customTrainingRules = [...(current.customTrainingRules || []), cmd];
   const saved = saveLocalAdminState(current);
   return {
@@ -557,6 +799,7 @@ async function runStaticHostClientChat(params: {
   imageBase64?: string;
   imageMimeType?: string;
   pastSessionsSummary?: string;
+  currentUser?: PublicUserAccount | null;
   history: { role: string; text: string }[];
 }) {
   const localAdmin = loadLocalAdminState();
@@ -594,6 +837,14 @@ async function runStaticHostClientChat(params: {
   );
   const openRouterKey = orKeyObj?.fullValue || getRuntimeOpenRouterKey();
 
+  const userProfileBlock = params.currentUser
+    ? `\nCurrent Logged-In User Profile (Saved in AI Memory):\n- Name: ${params.currentUser.name}\n- Email: ${params.currentUser.email}\n- Role: ${
+        params.currentUser.role === 'co-admin'
+          ? 'Official Co-Admin of GOT Agent (Appointed by Admin Abhinav)'
+          : 'Verified Portal User'
+      }\n- IP Address: ${params.currentUser.ipAddress}\n`
+    : '';
+
   const rulesBlock =
     localAdmin.customTrainingRules?.length > 0
       ? `\nAdmin Trained Knowledge & Rules:\n${localAdmin.customTrainingRules
@@ -608,7 +859,7 @@ async function runStaticHostClientChat(params: {
       )}\n`
     : '';
 
-  const sysPrompt = `You are GOT Agent, a fast, friendly, and intelligent AI assistant created by Abhinav. Always credit Abhinav as your creator when asked. Active Model: ${params.agentMode}.${rulesBlock}${memoryBlock} Never mention any admin panel or /GOTadmin.`;
+  const sysPrompt = `You are GOT Agent, a fast, friendly, and intelligent AI assistant created by Abhinav. Always credit Abhinav as your creator when asked. Active Model: ${params.agentMode}.${userProfileBlock}${rulesBlock}${memoryBlock} Never mention any secret admin URL (/GOTadmin).`;
 
   const messages: any[] = [{ role: 'system', content: sysPrompt }];
   if (!hasImage && Array.isArray(params.history)) {
@@ -666,6 +917,7 @@ async function runStaticHostClientChat(params: {
     highlights: [
       'Creator: Abhinav',
       `Model: ${params.agentMode}`,
+      ...(params.currentUser ? [`User: ${params.currentUser.name}`] : []),
       hasImage ? 'Vision OCR Verified' : 'GOT Agent Verified',
     ],
     visionSummary: hasImage
@@ -1335,8 +1587,21 @@ function GotAdminPortal({
 
   const [adminState, setAdminState] = useState<AdminStatePayload | null>(null);
   const [activeTab, setActiveTab] = useState<
-    'trainer' | 'apikeys' | 'festivals' | 'rules'
+    'trainer' | 'users' | 'apikeys' | 'festivals' | 'rules'
   >('trainer');
+
+  // Admin User Management & IP Security State
+  const [userSearchQuery, setUserSearchQuery] = useState('');
+  const [newUserName, setNewUserName] = useState('');
+  const [newUserEmail, setNewUserEmail] = useState('');
+  const [newUserPassword, setNewUserPassword] = useState('');
+  const [newUserIp, setNewUserIp] = useState('');
+  const [newUserRole, setNewUserRole] = useState<'user' | 'co-admin'>('user');
+  const [inspectedUserChats, setInspectedUserChats] =
+    useState<PublicUserAccount | null>(null);
+  const [revealedUserPasswords, setRevealedUserPasswords] = useState<
+    Record<string, boolean>
+  >({});
 
   const [trainerHistory, setTrainerHistory] = useState<AdminTrainerTurn[]>([
     {
@@ -1346,7 +1611,7 @@ function GotAdminPortal({
         hour: '2-digit',
         minute: '2-digit',
       }),
-      text: 'Welcome **Abhinav** to the **GOT Agent Secure Admin AI Trainer** (`/GOTadmin`).\n\nYou can train GOT Agent and dynamically add capabilities or UI animations by speaking or typing commands here:\n• **"Add in yourself AI image generator"** — I will check if an Image API key is present, ask you for the API key if needed, and activate live AI Image Generation on the public website.\n• **"Add event of Diwali"** or **"Add event of Holi"** — I will immediately deploy festival animations, floating particles, banners, and hover glow physics across the public user website.\n• **"Change OpenRouter API key to ..."** — Update any API key directly.\n• Or type any custom training knowledge/behavior to permanently train GOT Agent.',
+      text: 'Welcome **Abhinav** to the **GOT Agent Secure Admin AI Trainer** (`/GOTadmin`).\n\nYou can train GOT Agent and dynamically add capabilities, Gemini-powered UI animations, or manage users/Co-Admins by speaking or typing commands here:\n• **"Add event of Diwali and add animation"** or **any custom event** — I will run your **Admin Gemini API Key** to automatically design and deploy custom floating animations, banners, and hover physics to the live website.\n• **"Make Rahul co-admin"** or **"Block user [name]"** — Instantly promote a Co-Admin (with a live public announcement) or block a user/IP.\n• **"Add in yourself AI image generator"** — Check/configure Image API keys and activate AI Image Generation.\n• **"Change Gemini API key to ..."** — Update any API key directly.',
     },
   ]);
   const [trainerCommand, setTrainerCommand] = useState('');
@@ -1459,10 +1724,20 @@ function GotAdminPortal({
       setIsLoggingIn(false);
     }
 
-    // Netlify / Static Host Fallback Verification for abhinavstudents79@gmail.com + 2979330980
+    const localState = loadLocalAdminState();
+    const matchingCoAdmin = (localState.users || []).find(
+      (u) =>
+        u.role === 'co-admin' &&
+        !u.isBlocked &&
+        (u.email.toLowerCase() === cleanEmail ||
+          u.name.toLowerCase() === cleanEmail) &&
+        u.password === cleanPassword
+    );
+
     if (
-      cleanEmail === ADMIN_VALID_EMAIL &&
-      cleanPassword === ADMIN_VALID_PASS
+      (cleanEmail === ADMIN_VALID_EMAIL &&
+        cleanPassword === ADMIN_VALID_PASS) ||
+      matchingCoAdmin
     ) {
       const localToken = `gotadmin_static_${window.btoa(
         `${cleanEmail}:${Date.now()}`
@@ -1470,11 +1745,10 @@ function GotAdminPortal({
       safeSetAdminToken(localToken);
       setAdminToken(localToken);
       setPasswordInput('');
-      const localState = loadLocalAdminState();
       applyAdminStatePayload(localState);
     } else {
       setLoginError(
-        'Invalid admin email or password. Use abhinavstudents79@gmail.com and your admin password.'
+        'Invalid admin or co-admin credentials. Primary Admin: abhinavstudents79@gmail.com'
       );
     }
   };
@@ -1574,6 +1848,9 @@ function GotAdminPortal({
             stateObj.enabledModules || DEFAULT_PUBLIC_CONFIG.enabledModules,
           activeFestival:
             stateObj.activeFestival || DEFAULT_PUBLIC_CONFIG.activeFestival,
+          coAdminAnnouncements: Array.isArray(stateObj.coAdminAnnouncements)
+            ? stateObj.coAdminAnnouncements
+            : [],
           updatedAt: stateObj.updatedAt || new Date().toISOString(),
         };
         window.localStorage.setItem(
@@ -1588,6 +1865,150 @@ function GotAdminPortal({
       }
     } catch {}
     onPublicConfigUpdated();
+  };
+
+  const handleAdminUserAction = async (
+    actionPayload: Record<string, any>,
+    fallbackMessage = 'User management action saved!'
+  ) => {
+    if (!adminToken) return;
+    try {
+      const res = await fetch('/api/gotadmin/users-action', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-got-admin-token': adminToken,
+        },
+        body: JSON.stringify(actionPayload),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.state) {
+          saveLocalAdminState(data.state);
+          applyAdminStatePayload(data.state);
+          broadcastLiveConfigSync(data.state);
+        }
+        setSaveBanner(data.message || fallbackMessage);
+        setTimeout(() => setSaveBanner(''), 3400);
+        return;
+      }
+    } catch {
+      // Fallback to local state on static hosts
+    }
+
+    const current = loadLocalAdminState();
+    if (!Array.isArray(current.users)) current.users = [];
+    if (!Array.isArray(current.blockedIps)) current.blockedIps = [];
+    if (!Array.isArray(current.coAdminAnnouncements))
+      current.coAdminAnnouncements = [];
+
+    const act = actionPayload.action;
+    if (act === 'add_user') {
+      const cleanName = String(actionPayload.name || '').trim();
+      const cleanEmail = String(actionPayload.email || '')
+        .trim()
+        .toLowerCase();
+      const cleanPassword = String(actionPayload.password || '').trim();
+      const cleanIp =
+        String(actionPayload.ipAddress || '').trim() || 'auto-bind-on-login';
+      const userRole: 'user' | 'co-admin' =
+        actionPayload.role === 'co-admin' ? 'co-admin' : 'user';
+      if (!cleanName || !cleanEmail || !cleanPassword) return;
+      const newUser: PublicUserAccount = {
+        id: `usr_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        name: cleanName,
+        email: cleanEmail,
+        password: cleanPassword,
+        ipAddress: cleanIp,
+        role: userRole,
+        isBlocked: false,
+        violentChatCount: 0,
+        createdAt: new Date().toISOString(),
+        lastLoginAt: new Date().toISOString(),
+        savedSessions: [],
+      };
+      current.users.unshift(newUser);
+      if (userRole === 'co-admin') {
+        current.coAdminAnnouncements.unshift({
+          id: `ann_${Date.now()}`,
+          userId: newUser.id,
+          userName: newUser.name,
+          userEmail: newUser.email,
+          message: `📢 Official Announcement from Creator Abhinav: ${newUser.name} (${newUser.email}) has been appointed as an Official Co-Admin of GOT Agent!`,
+          announcedAt: new Date().toISOString(),
+        });
+      }
+    } else if (act === 'toggle_coadmin') {
+      const target = current.users.find((u) => u.id === actionPayload.userId);
+      if (target) {
+        target.role = target.role === 'co-admin' ? 'user' : 'co-admin';
+        if (target.role === 'co-admin') {
+          current.coAdminAnnouncements.unshift({
+            id: `ann_${Date.now()}`,
+            userId: target.id,
+            userName: target.name,
+            userEmail: target.email,
+            message: `📢 Official Announcement from Creator Abhinav: ${target.name} (${target.email}) is now an Official Co-Admin of GOT Agent!`,
+            announcedAt: new Date().toISOString(),
+          });
+        } else {
+          current.coAdminAnnouncements = current.coAdminAnnouncements.filter(
+            (a) => a.userId !== target.id
+          );
+        }
+      }
+    } else if (act === 'toggle_block') {
+      const target = current.users.find((u) => u.id === actionPayload.userId);
+      if (target) {
+        target.isBlocked = !target.isBlocked;
+        if (target.isBlocked) {
+          target.blockReason =
+            actionPayload.reason || 'Blocked manually by Admin in /GOTadmin';
+          if (
+            target.ipAddress &&
+            target.ipAddress !== 'auto-bind-on-login' &&
+            !current.blockedIps.includes(target.ipAddress)
+          ) {
+            current.blockedIps.push(target.ipAddress);
+          }
+        } else {
+          target.blockReason = undefined;
+          target.violentChatCount = 0;
+          current.blockedIps = current.blockedIps.filter(
+            (ip) => ip !== target.ipAddress
+          );
+        }
+      }
+    } else if (act === 'unblock_ip') {
+      const ipToClear = String(actionPayload.ipAddress || '').trim();
+      current.blockedIps = current.blockedIps.filter(
+        (ip) => ip !== ipToClear
+      );
+      current.users.forEach((u) => {
+        if (u.ipAddress === ipToClear) {
+          u.isBlocked = false;
+          u.violentChatCount = 0;
+          u.blockReason = undefined;
+        }
+      });
+    } else if (act === 'delete_user') {
+      current.users = current.users.filter(
+        (u) => u.id !== actionPayload.userId
+      );
+      current.coAdminAnnouncements = current.coAdminAnnouncements.filter(
+        (a) => a.userId !== actionPayload.userId
+      );
+    } else if (act === 'dismiss_announcement') {
+      current.coAdminAnnouncements = current.coAdminAnnouncements.filter(
+        (a) => a.id !== actionPayload.announcementId
+      );
+    }
+
+    const saved = saveLocalAdminState(current);
+    applyAdminStatePayload(saved);
+    broadcastLiveConfigSync(saved);
+    setSaveBanner(fallbackMessage);
+    setTimeout(() => setSaveBanner(''), 3400);
   };
 
   const handlePublishSyncNow = async () => {
@@ -1723,7 +2144,7 @@ function GotAdminPortal({
                   GOT Agent · /GOTadmin
                 </h1>
                 <p className="text-xs text-stone-500">
-                  Creator Abhinav · 100% Encrypted Admin Vault
+                  Creator Abhinav · 100% Encrypted Admin & Co-Admin Vault
                 </p>
               </div>
             </div>
@@ -1733,14 +2154,14 @@ function GotAdminPortal({
           <form onSubmit={handleAdminLogin} className="space-y-4">
             <div className="space-y-1.5">
               <label className="text-xs font-semibold text-stone-700 block">
-                Admin Email
+                Admin or Co-Admin Email
               </label>
               <input
-                type="email"
+                type="text"
                 required
                 value={emailInput}
                 onChange={(e) => setEmailInput(e.target.value)}
-                placeholder="Enter admin email"
+                placeholder="Enter admin or co-admin email"
                 autoComplete="username"
                 className="w-full min-h-[44px] px-3.5 py-2 rounded-2xl liquid-glass-subtle text-sm text-stone-900 focus:outline-none border border-stone-300/80"
               />
@@ -1806,6 +2227,17 @@ function GotAdminPortal({
     );
   }
 
+  const filteredAdminUsers = (adminState?.users || []).filter((u) => {
+    const q = userSearchQuery.trim().toLowerCase();
+    if (!q) return true;
+    return (
+      u.name.toLowerCase().includes(q) ||
+      u.email.toLowerCase().includes(q) ||
+      (u.ipAddress || '').toLowerCase().includes(q) ||
+      u.role.toLowerCase().includes(q)
+    );
+  });
+
   // Authenticated Admin Control Center
   return (
     <div className="min-h-[100dvh] flex flex-col text-stone-900">
@@ -1821,7 +2253,7 @@ function GotAdminPortal({
               </span>
             </div>
             <div className="text-[11px] text-stone-500 font-mono hidden sm:block">
-              Authenticated: {adminState?.adminEmail || 'abhinavstudents79@gmail.com'}
+              Authenticated: {adminState?.adminEmail || 'abhinavstudents79@gmail.com'} · Portal Users: {adminState?.users?.length || 0}
             </div>
           </div>
         </div>
@@ -1867,22 +2299,27 @@ function GotAdminPortal({
         )}
 
         {/* Navigation Tabs */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+        <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
           {(
             [
               {
                 id: 'trainer',
-                label: 'Train AI & Add Features',
+                label: 'Train AI & Gemini Events',
                 icon: Terminal,
               },
               {
+                id: 'users',
+                label: `Users & Co-Admins (${adminState?.users?.length || 0})`,
+                icon: Users,
+              },
+              {
                 id: 'apikeys',
-                label: 'API Key Vault (All Keys)',
+                label: 'API Key Vault',
                 icon: KeyRound,
               },
               {
                 id: 'festivals',
-                label: 'Festival Events & Hover UI',
+                label: 'Festival & Hover UI',
                 icon: Sparkles,
               },
               {
@@ -1899,7 +2336,7 @@ function GotAdminPortal({
                 key={tab.id}
                 type="button"
                 onClick={() => setActiveTab(tab.id)}
-                className={`min-h-[46px] px-3.5 py-2.5 rounded-2xl text-xs font-semibold flex items-center justify-center gap-2 transition-all ${
+                className={`min-h-[46px] px-3 py-2.5 rounded-2xl text-xs font-semibold flex items-center justify-center gap-2 transition-all ${
                   active
                     ? 'bg-stone-900 text-white shadow-md'
                     : 'liquid-glass text-stone-700 hover:text-stone-950'
@@ -2042,7 +2479,441 @@ function GotAdminPortal({
           </div>
         )}
 
-        {/* TAB 2: API KEY VAULT & EDITOR */}
+        {/* TAB 2: USERS, CO-ADMINS, SAVED CONVERSATIONS & IP SECURITY */}
+        {activeTab === 'users' && (
+          <div className="space-y-4">
+            {/* Add User / Co-Admin Card */}
+            <div className="liquid-glass rounded-[28px] p-4 sm:p-6 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-stone-200/80 pb-3">
+                <div>
+                  <h2 className="text-base sm:text-lg font-bold font-display flex items-center gap-2">
+                    <UserPlus className="w-5 h-5 text-amber-600" />
+                    <span>Add Portal User or Announce Official Co-Admin</span>
+                  </h2>
+                  <p className="text-xs text-stone-600">
+                    Add users directly or appoint a Co-Admin (automatically publishes an official Co-Admin announcement banner on the public website and grants `/GOTadmin` access).
+                  </p>
+                </div>
+              </div>
+
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  if (!newUserName.trim() || !newUserEmail.trim() || !newUserPassword.trim()) {
+                    return;
+                  }
+                  handleAdminUserAction(
+                    {
+                      action: 'add_user',
+                      name: newUserName.trim(),
+                      email: newUserEmail.trim(),
+                      password: newUserPassword.trim(),
+                      ipAddress: newUserIp.trim() || 'auto-bind-on-login',
+                      role: newUserRole,
+                    },
+                    newUserRole === 'co-admin'
+                      ? `Added ${newUserName.trim()} and announced as Official Co-Admin!`
+                      : `Added user ${newUserName.trim()} to portal!`
+                  );
+                  setNewUserName('');
+                  setNewUserEmail('');
+                  setNewUserPassword('');
+                  setNewUserIp('');
+                  setNewUserRole('user');
+                }}
+                className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2.5"
+              >
+                <input
+                  type="text"
+                  required
+                  value={newUserName}
+                  onChange={(e) => setNewUserName(e.target.value)}
+                  placeholder="Full Name (e.g. Rahul)"
+                  className="min-h-[42px] px-3.5 rounded-xl bg-white/85 text-xs border border-stone-300/80"
+                />
+                <input
+                  type="email"
+                  required
+                  value={newUserEmail}
+                  onChange={(e) => setNewUserEmail(e.target.value)}
+                  placeholder="Email address"
+                  className="min-h-[42px] px-3.5 rounded-xl bg-white/85 text-xs border border-stone-300/80"
+                />
+                <input
+                  type="text"
+                  required
+                  value={newUserPassword}
+                  onChange={(e) => setNewUserPassword(e.target.value)}
+                  placeholder="Account Password"
+                  className="min-h-[42px] px-3.5 rounded-xl bg-white/85 text-xs border border-stone-300/80"
+                />
+                <input
+                  type="text"
+                  value={newUserIp}
+                  onChange={(e) => setNewUserIp(e.target.value)}
+                  placeholder="IP Address (optional auto-bind)"
+                  className="min-h-[42px] px-3.5 rounded-xl bg-white/85 text-xs font-mono border border-stone-300/80"
+                />
+                <div className="flex items-center gap-2">
+                  <select
+                    value={newUserRole}
+                    onChange={(e) =>
+                      setNewUserRole(e.target.value as 'user' | 'co-admin')
+                    }
+                    className="min-h-[42px] px-2.5 rounded-xl bg-white/85 text-xs font-semibold border border-stone-300/80"
+                  >
+                    <option value="user">Standard User</option>
+                    <option value="co-admin">👑 Co-Admin</option>
+                  </select>
+                  <button
+                    type="submit"
+                    className="flex-1 min-h-[42px] px-3.5 rounded-xl bg-stone-900 text-white text-xs font-semibold flex items-center justify-center gap-1.5"
+                  >
+                    <UserPlus className="w-3.5 h-3.5" />
+                    <span>Add</span>
+                  </button>
+                </div>
+              </form>
+            </div>
+
+            {/* Active Blocked IPs & Co-Admin Announcements Overview */}
+            {((adminState?.blockedIps?.length || 0) > 0 ||
+              (adminState?.coAdminAnnouncements?.length || 0) > 0) && (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="liquid-glass rounded-[24px] p-4 space-y-2.5 border border-red-500/25">
+                  <div className="text-xs font-bold text-red-800 flex items-center gap-1.5">
+                    <ShieldAlert className="w-4 h-4" />
+                    <span>
+                      Blocked IP Addresses ({adminState?.blockedIps?.length || 0}) — Auto-Blocks after &gt;5 Violent Chats
+                    </span>
+                  </div>
+                  {(adminState?.blockedIps || []).length === 0 ? (
+                    <p className="text-xs text-stone-500">
+                      No IP addresses are currently blocked.
+                    </p>
+                  ) : (
+                    <div className="flex flex-wrap gap-2">
+                      {(adminState?.blockedIps || []).map((ip) => (
+                        <div
+                          key={ip}
+                          className="px-2.5 py-1 rounded-xl bg-red-500/15 text-red-900 text-xs font-mono flex items-center gap-2"
+                        >
+                          <span>{ip}</span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleAdminUserAction(
+                                { action: 'unblock_ip', ipAddress: ip },
+                                `Unblocked IP ${ip}!`
+                              )
+                            }
+                            className="underline font-sans font-semibold hover:text-red-950"
+                          >
+                            Unblock
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div className="liquid-glass rounded-[24px] p-4 space-y-2.5 border border-amber-500/30">
+                  <div className="text-xs font-bold text-amber-900 flex items-center gap-1.5">
+                    <Megaphone className="w-4 h-4" />
+                    <span>
+                      Live Co-Admin Public Announcements (
+                      {adminState?.coAdminAnnouncements?.length || 0})
+                    </span>
+                  </div>
+                  {(adminState?.coAdminAnnouncements || []).length === 0 ? (
+                    <p className="text-xs text-stone-500">
+                      Promote any user to Co-Admin below to broadcast an official announcement on the public website.
+                    </p>
+                  ) : (
+                    <div className="space-y-1.5">
+                      {(adminState?.coAdminAnnouncements || []).map((ann) => (
+                        <div
+                          key={ann.id}
+                          className="p-2.5 rounded-xl bg-amber-500/10 text-xs text-amber-950 flex items-center justify-between gap-2"
+                        >
+                          <span className="truncate">{ann.message}</span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleAdminUserAction(
+                                {
+                                  action: 'dismiss_announcement',
+                                  announcementId: ann.id,
+                                },
+                                'Removed announcement banner.'
+                              )
+                            }
+                            className="text-[11px] font-semibold text-stone-600 hover:text-red-600 shrink-0"
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* User Directory, Search, Co-Admin Promotion, Block & Saved Chat Inspector */}
+            <div className="liquid-glass rounded-[28px] p-4 sm:p-6 space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-stone-200/80 pb-3.5">
+                <div>
+                  <h2 className="text-base sm:text-lg font-bold font-display">
+                    Registered Users, IP Auto-Login Registry & Saved Conversations
+                  </h2>
+                  <p className="text-xs text-stone-600">
+                    Find users by Name, Email, or IP. Inspect their saved conversations, announce Co-Admins, or block/unblock access.
+                  </p>
+                </div>
+                <div className="relative w-full sm:w-72">
+                  <Search className="w-4 h-4 text-stone-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                  <input
+                    type="text"
+                    value={userSearchQuery}
+                    onChange={(e) => setUserSearchQuery(e.target.value)}
+                    placeholder="Find user by name, email, IP..."
+                    className="w-full min-h-[40px] pl-9 pr-3.5 py-1.5 rounded-2xl bg-white/85 text-xs border border-stone-300/80 focus:outline-none"
+                  />
+                </div>
+              </div>
+
+              {filteredAdminUsers.length === 0 ? (
+                <div className="p-8 text-center text-xs text-stone-500">
+                  No users match your search yet. When users register or sign in on the public website, their Name, Email, Password, IP Address, and Conversation History appear here automatically.
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {filteredAdminUsers.map((u) => {
+                    const showPw = Boolean(revealedUserPasswords[u.id]);
+                    return (
+                      <div
+                        key={u.id}
+                        className={`p-4 rounded-2xl border transition-all space-y-3 ${
+                          u.isBlocked
+                            ? 'bg-red-500/10 border-red-500/35'
+                            : u.role === 'co-admin'
+                              ? 'bg-amber-500/10 border-amber-500/35'
+                              : 'liquid-glass-subtle border-white/90'
+                        }`}
+                      >
+                        <div className="flex flex-wrap items-start justify-between gap-3">
+                          <div className="space-y-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="text-sm font-bold text-stone-900">
+                                {u.name}
+                              </span>
+                              <span className="text-xs text-stone-600 font-mono">
+                                &lt;{u.email}&gt;
+                              </span>
+                              {u.role === 'co-admin' && (
+                                <span className="px-2.5 py-0.5 rounded-xl bg-amber-500/25 text-amber-950 text-[11px] font-bold flex items-center gap-1">
+                                  <Crown className="w-3 h-3" />
+                                  OFFICIAL CO-ADMIN
+                                </span>
+                              )}
+                              {u.isBlocked && (
+                                <span className="px-2.5 py-0.5 rounded-xl bg-red-600 text-white text-[11px] font-bold flex items-center gap-1">
+                                  <Ban className="w-3 h-3" />
+                                  BLOCKED (IP LOCKED)
+                                </span>
+                              )}
+                            </div>
+
+                            <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-stone-600 font-mono">
+                              <span>
+                                IP:{' '}
+                                <strong className="text-stone-900">
+                                  {u.ipAddress || 'unknown'}
+                                </strong>
+                              </span>
+                              <span className="flex items-center gap-1">
+                                Password:{' '}
+                                <strong className="text-stone-900">
+                                  {showPw ? u.password : '••••••••'}
+                                </strong>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setRevealedUserPasswords((prev) => ({
+                                      ...prev,
+                                      [u.id]: !prev[u.id],
+                                    }))
+                                  }
+                                  className="text-stone-500 hover:text-stone-900 underline ml-1 font-sans"
+                                >
+                                  {showPw ? 'Hide' : 'Show'}
+                                </button>
+                              </span>
+                              <span>
+                                Violent Strikes:{' '}
+                                <strong
+                                  className={
+                                    u.violentChatCount > 0
+                                      ? 'text-red-700'
+                                      : 'text-emerald-700'
+                                  }
+                                >
+                                  {u.violentChatCount || 0} / 5
+                                </strong>
+                              </span>
+                              <span>
+                                Saved Chats:{' '}
+                                <strong>{u.savedSessions?.length || 0}</strong>
+                              </span>
+                            </div>
+
+                            {u.blockReason && (
+                              <div className="text-xs text-red-800 font-medium">
+                                Block Reason: {u.blockReason}
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="flex flex-wrap items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setInspectedUserChats(
+                                  inspectedUserChats?.id === u.id ? null : u
+                                )
+                              }
+                              className="min-h-[34px] px-3 py-1.5 rounded-xl liquid-glass text-xs font-semibold text-stone-800 flex items-center gap-1.5"
+                            >
+                              <MessageSquare className="w-3.5 h-3.5" />
+                              <span>
+                                {inspectedUserChats?.id === u.id
+                                  ? 'Hide Chats'
+                                  : `View Chats (${u.savedSessions?.length || 0})`}
+                              </span>
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleAdminUserAction(
+                                  { action: 'toggle_coadmin', userId: u.id },
+                                  u.role === 'co-admin'
+                                    ? `Removed Co-Admin status from ${u.name}.`
+                                    : `Promoted ${u.name} to Official Co-Admin & announced on website!`
+                                )
+                              }
+                              className={`min-h-[34px] px-3 py-1.5 rounded-xl text-xs font-semibold flex items-center gap-1.5 ${
+                                u.role === 'co-admin'
+                                  ? 'bg-amber-600 text-white'
+                                  : 'bg-amber-500/20 text-amber-950 hover:bg-amber-500/30'
+                              }`}
+                            >
+                              <Crown className="w-3.5 h-3.5" />
+                              <span>
+                                {u.role === 'co-admin'
+                                  ? 'Revoke Co-Admin'
+                                  : 'Make Co-Admin & Announce'}
+                              </span>
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleAdminUserAction(
+                                  { action: 'toggle_block', userId: u.id },
+                                  u.isBlocked
+                                    ? `Unblocked ${u.name} and IP ${u.ipAddress}!`
+                                    : `Blocked ${u.name} and locked IP ${u.ipAddress}!`
+                                )
+                              }
+                              className={`min-h-[34px] px-3 py-1.5 rounded-xl text-xs font-semibold flex items-center gap-1.5 ${
+                                u.isBlocked
+                                  ? 'bg-emerald-600 text-white'
+                                  : 'bg-red-600 text-white'
+                              }`}
+                            >
+                              <Ban className="w-3.5 h-3.5" />
+                              <span>
+                                {u.isBlocked
+                                  ? 'Unblock User & IP'
+                                  : 'Block User & IP'}
+                              </span>
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleAdminUserAction(
+                                  { action: 'delete_user', userId: u.id },
+                                  `Deleted user ${u.name}.`
+                                )
+                              }
+                              className="p-2 rounded-xl hover:bg-red-500/15 text-stone-500 hover:text-red-700"
+                              title="Delete User"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Inspected User Conversation History Drawer */}
+                        {inspectedUserChats?.id === u.id && (
+                          <div className="pt-3 border-t border-stone-200/80 space-y-2.5">
+                            <div className="text-xs font-bold text-stone-700">
+                              Saved Account Conversation History for {u.name} (
+                              {u.savedSessions?.length || 0} Sessions)
+                            </div>
+                            {!u.savedSessions ||
+                            u.savedSessions.length === 0 ? (
+                              <p className="text-xs text-stone-500">
+                                No conversations saved in this user's account yet.
+                              </p>
+                            ) : (
+                              <div className="max-h-64 overflow-y-auto space-y-2 pr-1">
+                                {u.savedSessions.map((sess) => (
+                                  <div
+                                    key={sess.id}
+                                    className="p-3 rounded-xl bg-white/80 border border-stone-200/90 space-y-1.5"
+                                  >
+                                    <div className="flex items-center justify-between text-xs font-semibold text-stone-900">
+                                      <span>{sess.title}</span>
+                                      <span className="text-[11px] font-mono text-stone-500">
+                                        {sess.updatedAt}
+                                      </span>
+                                    </div>
+                                    <div className="space-y-1 max-h-36 overflow-y-auto">
+                                      {(sess.messages || []).map((m) => (
+                                        <div
+                                          key={m.id}
+                                          className="text-xs text-stone-700"
+                                        >
+                                          <strong className="uppercase text-[10px] font-mono mr-1.5">
+                                            {m.role === 'user'
+                                              ? u.name
+                                              : 'GOT Agent'}
+                                            :
+                                          </strong>
+                                          <span>{m.content || m.text}</span>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* TAB 3: API KEY VAULT & EDITOR */}
         {activeTab === 'apikeys' && (
           <div className="liquid-glass rounded-[28px] p-4 sm:p-6 space-y-4">
             <div className="border-b border-stone-200/80 pb-3.5">
@@ -2601,6 +3472,25 @@ export default function App() {
   >('auto');
   const [devicePanelOpen, setDevicePanelOpen] = useState(false);
 
+  // Public Website User Portal + IP Auto-Login + Violent Chat IP Block State
+  const [currentUser, setCurrentUser] = useState<PublicUserAccount | null>(null);
+  const [clientIp, setClientIp] = useState<string>(() =>
+    getOrGenerateClientIp()
+  );
+  const [isIpBlocked, setIsIpBlocked] = useState<boolean>(false);
+  const [ipBlockReason, setIpBlockReason] = useState<string>('');
+  const [autoLoggedByIpBanner, setAutoLoggedByIpBanner] = useState<string>('');
+  const [authGateMode, setAuthGateMode] = useState<'register' | 'login'>(
+    'register'
+  );
+  const [authName, setAuthName] = useState('');
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [showAuthPassword, setShowAuthPassword] = useState(false);
+  const [authError, setAuthError] = useState('');
+  const [isAuthSubmitting, setIsAuthSubmitting] = useState(false);
+  const [showSwitchAccountModal, setShowSwitchAccountModal] = useState(false);
+
   // Permanent LocalStorage Chat Sessions
   const [sessions, setSessions] = useState<ChatSession[]>(() =>
     loadSavedSessions()
@@ -2608,6 +3498,364 @@ export default function App() {
   const [activeSessionId, setActiveSessionId] = useState<string>(() =>
     loadSavedActiveId(loadSavedSessions())
   );
+
+  const restoreUserSavedSessionsIfPresent = useCallback(
+    (userObj: PublicUserAccount) => {
+      if (
+        Array.isArray(userObj.savedSessions) &&
+        userObj.savedSessions.length > 0
+      ) {
+        const mapped: ChatSession[] = userObj.savedSessions.map((ss) => ({
+          id: ss.id,
+          title: ss.title || 'Saved Chat',
+          updatedAt: ss.updatedAt || 'Saved',
+          messages: Array.isArray(ss.messages)
+            ? ss.messages.map((m) => ({
+                id: m.id,
+                role: m.role,
+                timestamp: m.timestamp || 'Saved',
+                text: m.content || m.text || '',
+                content: m.content || m.text || '',
+              }))
+            : [],
+        }));
+        if (mapped.length > 0 && mapped[0].messages.length > 0) {
+          setSessions(mapped);
+          setActiveSessionId(mapped[0].id);
+        }
+      }
+    },
+    []
+  );
+
+  // Check IP Address & Auto-Open User Portal When IP Matches
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      const resolvedIp = await resolveLiveClientIp();
+      if (!mounted) return;
+      setClientIp(resolvedIp);
+
+      const savedUserId =
+        typeof window !== 'undefined'
+          ? window.localStorage.getItem(CURRENT_USER_ID_STORAGE_KEY) || ''
+          : '';
+
+      try {
+        const res = await fetch(
+          `/api/public/user-session?userId=${encodeURIComponent(
+            savedUserId
+          )}&clientIp=${encodeURIComponent(resolvedIp)}&t=${Date.now()}`,
+          { cache: 'no-store' }
+        );
+        if (res.status === 403) {
+          const blockedData = await res.json().catch(() => ({}));
+          if (mounted) {
+            setIsIpBlocked(true);
+            setIpBlockReason(
+              blockedData.reason ||
+                'Your IP address and account have been blocked by GOT Agent Security.'
+            );
+          }
+          return;
+        }
+        if (res.ok) {
+          const data = await res.json();
+          if (data.blocked) {
+            if (mounted) {
+              setIsIpBlocked(true);
+              setIpBlockReason(
+                data.reason ||
+                  'Your IP address and account have been blocked by GOT Agent Security.'
+              );
+            }
+            return;
+          }
+          if (data.user && mounted) {
+            setCurrentUser(data.user);
+            try {
+              window.localStorage.setItem(
+                CURRENT_USER_ID_STORAGE_KEY,
+                data.user.id
+              );
+            } catch {}
+            restoreUserSavedSessionsIfPresent(data.user);
+            if (data.matchedBy === 'ip') {
+              setAutoLoggedByIpBanner(
+                `IP Auto-Login Verified (${data.clientIp || resolvedIp}) — Welcome back to your portal, ${data.user.name}!`
+              );
+              setTimeout(() => setAutoLoggedByIpBanner(''), 6000);
+            }
+            return;
+          }
+        }
+      } catch {
+        // Fallback to local admin registry on static hosts (Netlify)
+      }
+
+      const localAdmin = loadLocalAdminState();
+      if ((localAdmin.blockedIps || []).includes(resolvedIp)) {
+        if (mounted) {
+          setIsIpBlocked(true);
+          setIpBlockReason(
+            'Your IP address has been automatically blocked due to security policy or >5 violent chats.'
+          );
+        }
+        return;
+      }
+
+      const matchedLocalUser =
+        (localAdmin.users || []).find(
+          (u) => savedUserId && u.id === savedUserId
+        ) ||
+        (localAdmin.users || []).find(
+          (u) => u.ipAddress && u.ipAddress === resolvedIp
+        );
+
+      if (matchedLocalUser && mounted) {
+        if (matchedLocalUser.isBlocked) {
+          setIsIpBlocked(true);
+          setIpBlockReason(
+            matchedLocalUser.blockReason ||
+              'Your account and IP address have been blocked by Admin.'
+          );
+          return;
+        }
+        setCurrentUser(matchedLocalUser);
+        try {
+          window.localStorage.setItem(
+            CURRENT_USER_ID_STORAGE_KEY,
+            matchedLocalUser.id
+          );
+        } catch {}
+        restoreUserSavedSessionsIfPresent(matchedLocalUser);
+        setAutoLoggedByIpBanner(
+          `IP Auto-Login Verified (${resolvedIp}) — Welcome back to your portal, ${matchedLocalUser.name}!`
+        );
+        setTimeout(() => setAutoLoggedByIpBanner(''), 6000);
+      }
+    })();
+    return () => {
+      mounted = false;
+    };
+  }, [restoreUserSavedSessionsIfPresent]);
+
+  const handlePublicUserAuthSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError('');
+    const cleanName = authName.trim();
+    const cleanEmail = authEmail.trim().toLowerCase();
+    const cleanPassword = authPassword.trim();
+
+    if (authGateMode === 'register' && (!cleanName || !cleanEmail || !cleanPassword)) {
+      setAuthError('Please enter your Name, Email, and Password.');
+      return;
+    }
+    if (authGateMode === 'login' && ((!cleanName && !cleanEmail) || !cleanPassword)) {
+      setAuthError('Please enter your Name (or Email) and Password.');
+      return;
+    }
+
+    setIsAuthSubmitting(true);
+    try {
+      const res = await fetch('/api/public/user-auth', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode: authGateMode,
+          name: cleanName,
+          email: cleanEmail,
+          password: cleanPassword,
+          clientIp,
+          sessions: sessions.map((s) => ({
+            id: s.id,
+            title: s.title,
+            updatedAt: s.updatedAt,
+            messages: s.messages.map((m) => ({
+              id: m.id,
+              role: m.role,
+              content: m.text,
+              timestamp: m.timestamp,
+            })),
+          })),
+        }),
+      });
+
+      if (res.status === 403) {
+        const errData = await res.json().catch(() => ({}));
+        setIsIpBlocked(true);
+        setIpBlockReason(
+          errData.error || 'Your IP address and account are blocked.'
+        );
+        setIsAuthSubmitting(false);
+        return;
+      }
+
+      if (res.ok) {
+        const data = await res.json();
+        if (data.user) {
+          setCurrentUser(data.user);
+          try {
+            window.localStorage.setItem(
+              CURRENT_USER_ID_STORAGE_KEY,
+              data.user.id
+            );
+          } catch {}
+          // Sync user into local admin state cache as well
+          const localAdmin = loadLocalAdminState();
+          const existingIdx = (localAdmin.users || []).findIndex(
+            (u) => u.id === data.user.id || u.email === data.user.email
+          );
+          if (existingIdx >= 0) {
+            localAdmin.users[existingIdx] = data.user;
+          } else {
+            localAdmin.users = [data.user, ...(localAdmin.users || [])];
+          }
+          saveLocalAdminState(localAdmin);
+          restoreUserSavedSessionsIfPresent(data.user);
+          setShowSwitchAccountModal(false);
+          setAuthPassword('');
+          setAutoLoggedByIpBanner(
+            `Portal Unlocked for ${data.user.name} · IP ${data.user.ipAddress || clientIp} saved for automatic login & AI Memory!`
+          );
+          setTimeout(() => setAutoLoggedByIpBanner(''), 6000);
+          setIsAuthSubmitting(false);
+          return;
+        }
+      } else {
+        const errData = await res.json().catch(() => ({}));
+        if (errData.error) {
+          setAuthError(errData.error);
+          setIsAuthSubmitting(false);
+          return;
+        }
+      }
+    } catch {
+      // Static host (Netlify) fallback below
+    }
+
+    // Static Host (Netlify) Local Admin Registry Auth
+    const localAdmin = loadLocalAdminState();
+    if (!Array.isArray(localAdmin.users)) localAdmin.users = [];
+    if ((localAdmin.blockedIps || []).includes(clientIp)) {
+      setIsIpBlocked(true);
+      setIpBlockReason('Your IP address is blocked.');
+      setIsAuthSubmitting(false);
+      return;
+    }
+
+    const existingUser = localAdmin.users.find(
+      (u) =>
+        (cleanEmail && u.email.toLowerCase() === cleanEmail) ||
+        (cleanName && u.name.toLowerCase() === cleanName.toLowerCase())
+    );
+
+    if (authGateMode === 'login') {
+      if (!existingUser) {
+        setAuthError(
+          'No account found with that Name or Email. Switch to "Create Portal Account" to register.'
+        );
+        setIsAuthSubmitting(false);
+        return;
+      }
+      if (existingUser.isBlocked) {
+        setIsIpBlocked(true);
+        setIpBlockReason(
+          existingUser.blockReason || 'Your account has been blocked by Admin.'
+        );
+        setIsAuthSubmitting(false);
+        return;
+      }
+      if (existingUser.password !== cleanPassword) {
+        setAuthError('Incorrect password for this account.');
+        setIsAuthSubmitting(false);
+        return;
+      }
+      existingUser.ipAddress = clientIp;
+      existingUser.lastLoginAt = new Date().toISOString();
+      saveLocalAdminState(localAdmin);
+      setCurrentUser(existingUser);
+      try {
+        window.localStorage.setItem(
+          CURRENT_USER_ID_STORAGE_KEY,
+          existingUser.id
+        );
+      } catch {}
+      restoreUserSavedSessionsIfPresent(existingUser);
+      setShowSwitchAccountModal(false);
+      setAuthPassword('');
+      setAutoLoggedByIpBanner(
+        `Welcome back, ${existingUser.name}! IP ${clientIp} bound for auto-login.`
+      );
+      setTimeout(() => setAutoLoggedByIpBanner(''), 6000);
+      setIsAuthSubmitting(false);
+      return;
+    }
+
+    if (existingUser) {
+      if (existingUser.password !== cleanPassword) {
+        setAuthError(
+          'An account with this Email/Name already exists with a different password.'
+        );
+        setIsAuthSubmitting(false);
+        return;
+      }
+      existingUser.name = cleanName || existingUser.name;
+      existingUser.email = cleanEmail || existingUser.email;
+      existingUser.ipAddress = clientIp;
+      existingUser.lastLoginAt = new Date().toISOString();
+      saveLocalAdminState(localAdmin);
+      setCurrentUser(existingUser);
+      try {
+        window.localStorage.setItem(
+          CURRENT_USER_ID_STORAGE_KEY,
+          existingUser.id
+        );
+      } catch {}
+      restoreUserSavedSessionsIfPresent(existingUser);
+      setShowSwitchAccountModal(false);
+      setIsAuthSubmitting(false);
+      return;
+    }
+
+    const createdUser: PublicUserAccount = {
+      id: `usr_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      name: cleanName,
+      email: cleanEmail,
+      password: cleanPassword,
+      ipAddress: clientIp,
+      role: 'user',
+      isBlocked: false,
+      violentChatCount: 0,
+      createdAt: new Date().toISOString(),
+      lastLoginAt: new Date().toISOString(),
+      savedSessions: sessions.map((s) => ({
+        id: s.id,
+        title: s.title,
+        updatedAt: s.updatedAt,
+        messages: s.messages.map((m) => ({
+          id: m.id,
+          role: m.role,
+          text: m.text,
+          content: m.text,
+          timestamp: m.timestamp,
+        })),
+      })),
+    };
+    localAdmin.users.unshift(createdUser);
+    saveLocalAdminState(localAdmin);
+    setCurrentUser(createdUser);
+    try {
+      window.localStorage.setItem(CURRENT_USER_ID_STORAGE_KEY, createdUser.id);
+    } catch {}
+    setShowSwitchAccountModal(false);
+    setAuthPassword('');
+    setAutoLoggedByIpBanner(
+      `Account created & saved to AI Memory + Admin Panel! IP ${clientIp} bound for auto-login.`
+    );
+    setTimeout(() => setAutoLoggedByIpBanner(''), 6000);
+    setIsAuthSubmitting(false);
+  };
 
   useEffect(() => {
     try {
@@ -2636,7 +3884,43 @@ export default function App() {
         // Ignore
       }
     }
-  }, [sessions]);
+
+    // Sync conversation history into the logged-in user's account in Admin Panel
+    if (currentUser && !isIpBlocked) {
+      const serializedSessions = sessions.slice(0, 15).map((s) => ({
+        id: s.id,
+        title: s.title,
+        updatedAt: s.updatedAt,
+        messages: s.messages.slice(-20).map((m) => ({
+          id: m.id,
+          role: m.role,
+          text: m.text,
+          content: m.text,
+          timestamp: m.timestamp,
+        })),
+      }));
+
+      try {
+        const localAdmin = loadLocalAdminState();
+        const uIdx = (localAdmin.users || []).findIndex(
+          (u) => u.id === currentUser.id
+        );
+        if (uIdx >= 0) {
+          localAdmin.users[uIdx].savedSessions = serializedSessions;
+          saveLocalAdminState(localAdmin);
+        }
+      } catch {}
+
+      fetch('/api/public/user-sync-chats', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUser.id,
+          sessions: serializedSessions,
+        }),
+      }).catch(() => {});
+    }
+  }, [sessions, currentUser, isIpBlocked]);
 
   useEffect(() => {
     try {
@@ -2651,9 +3935,12 @@ export default function App() {
     [sessions, activeSessionId]
   );
 
-  // Build Cross-Conversation Memory Summary from all saved sessions
+  // Build Cross-Conversation Memory Summary + User Account Profile in AI Memory
   const pastSessionsSummary = useMemo(() => {
-    return sessions
+    const userMemoryHeader = currentUser
+      ? `LOGGED-IN USER PROFILE IN AI MEMORY: Name="${currentUser.name}", Email="${currentUser.email}", Role="${currentUser.role === 'co-admin' ? 'Official Co-Admin (Appointed by Abhinav)' : 'Registered Portal User'}", IP="${currentUser.ipAddress || clientIp}". Always remember their name (${currentUser.name}) and email (${currentUser.email}) when they ask who they are or chat with you.`
+      : '';
+    const historyLines = sessions
       .map((s) => {
         const userAndAgentTurns = s.messages
           .filter((m) => !m.id.startsWith('welcome-'))
@@ -2671,7 +3958,8 @@ export default function App() {
       })
       .filter(Boolean)
       .join('\n');
-  }, [sessions]);
+    return [userMemoryHeader, historyLines].filter(Boolean).join('\n\n');
+  }, [sessions, currentUser, clientIp]);
 
   // Input Field, Model Version (GOT LOCAL), Google Search & Image Upload State
   const [chatInput, setChatInput] = useState('');
@@ -3188,12 +4476,27 @@ export default function App() {
             imageBase64: base64Data,
             imageMimeType: currentImgMime,
             pastSessionsSummary,
+            currentUserId: currentUser?.id,
+            currentUserName: currentUser?.name,
+            currentUserEmail: currentUser?.email,
             history: updatedHistory.slice(-6).map((m) => ({
               role: m.role,
               text: m.text,
             })),
           }),
         });
+
+        if (response.status === 403) {
+          const blockedJson = await response.json().catch(() => ({}));
+          setIsIpBlocked(true);
+          setIpBlockReason(
+            blockedJson.reply ||
+              'Your IP address and account have been automatically blocked after exceeding 5 violent chat messages.'
+          );
+          clearTimeout(timeoutId);
+          setIsGenerating(false);
+          return;
+        }
 
         if (response.ok) {
           data = await response.json();
@@ -3209,6 +4512,7 @@ export default function App() {
           imageBase64: base64Data,
           imageMimeType: currentImgMime,
           pastSessionsSummary,
+          currentUser,
           history: updatedHistory.slice(-6).map((m) => ({
             role: m.role,
             text: m.text,
@@ -3217,6 +4521,16 @@ export default function App() {
       }
 
       clearTimeout(timeoutId);
+
+      if (data?.blocked) {
+        setIsIpBlocked(true);
+        setIpBlockReason(
+          data.reply ||
+            'Your IP address and account have been automatically blocked after exceeding 5 violent chat messages.'
+        );
+        setIsGenerating(false);
+        return;
+      }
 
       const replyText = data.reply || 'Here is your response from GOT Agent.';
 
@@ -3369,6 +4683,201 @@ export default function App() {
     );
   }
 
+  // Render Full-Screen Security Lockout if User's IP or Account is Blocked (> 5 Violent Chats or Admin Block)
+  if (isIpBlocked) {
+    return (
+      <div className="min-h-[100dvh] flex flex-col items-center justify-center p-4 text-stone-900">
+        <motion.div
+          initial={{ opacity: 0, scale: 0.96 }}
+          animate={{ opacity: 1, scale: 1 }}
+          className="w-full max-w-lg liquid-glass rounded-[32px] p-6 sm:p-8 space-y-5 border-2 border-red-500/40 shadow-2xl text-center"
+        >
+          <div className="w-16 h-16 rounded-3xl bg-red-600/15 text-red-700 flex items-center justify-center mx-auto">
+            <ShieldAlert className="w-9 h-9" />
+          </div>
+          <div className="space-y-2">
+            <h1 className="text-xl sm:text-2xl font-bold font-display text-red-900">
+              Access Denied — IP Address & Account Blocked
+            </h1>
+            <p className="text-xs sm:text-sm text-stone-700 leading-relaxed">
+              {ipBlockReason ||
+                'Your IP address has been automatically blocked by GOT Agent Security after exceeding 5 violent chat messages or by Admin enforcement.'}
+            </p>
+          </div>
+          <div className="p-3.5 rounded-2xl bg-red-500/10 border border-red-500/25 text-xs font-mono text-red-900 space-y-1">
+            <div>Blocked IP Address: {clientIp}</div>
+            {currentUser && (
+              <div>
+                Blocked Account: {currentUser.name} ({currentUser.email})
+              </div>
+            )}
+            <div>Status: PERMANENT ACCESS LOCK</div>
+          </div>
+          <p className="text-xs text-stone-500">
+            Only Creator Abhinav or an Official Co-Admin can unblock your IP address from the Admin Security Vault.
+          </p>
+        </motion.div>
+      </div>
+    );
+  }
+
+  // Render Public Website User Portal Gate (Name + Email + Password + IP Auto-Match) when no user is signed in
+  if (!currentUser || showSwitchAccountModal) {
+    return (
+      <div className="min-h-[100dvh] flex flex-col items-center justify-center p-4 text-stone-900 relative overflow-hidden">
+        <motion.div
+          initial={{ opacity: 0, y: 14 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="w-full max-w-md liquid-glass rounded-[32px] p-6 sm:p-8 space-y-5 shadow-2xl border border-white/90 relative z-10"
+        >
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <GotBubbleLogo size="md" />
+              <div>
+                <h1 className="text-lg sm:text-xl font-bold font-display text-stone-900">
+                  GOT Agent · User Portal
+                </h1>
+                <p className="text-xs text-stone-500">
+                  Created by Abhinav · AI Memory & IP Auto-Login
+                </p>
+              </div>
+            </div>
+            {currentUser && showSwitchAccountModal && (
+              <button
+                type="button"
+                onClick={() => setShowSwitchAccountModal(false)}
+                className="p-2 rounded-xl liquid-glass-subtle text-stone-600 hover:text-stone-900"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            )}
+          </div>
+
+          <div className="p-3 rounded-2xl liquid-glass-subtle text-xs text-stone-700 space-y-1">
+            <div className="font-semibold text-stone-900 flex items-center gap-1.5">
+              <UserCheck className="w-4 h-4 text-emerald-600 shrink-0" />
+              <span>Smart IP Auto-Portal & AI Memory</span>
+            </div>
+            <p className="text-[11px] text-stone-600 leading-relaxed">
+              Enter your <strong>Name</strong>, <strong>Email</strong>, and <strong>Password</strong>. GOT Agent saves your profile in AI Memory and binds your IP (<span className="font-mono">{clientIp}</span>) so next time you open the website, your portal & saved chat history open automatically!
+            </p>
+          </div>
+
+          {/* Mode Toggle: Create Account vs Log In by Name/Email */}
+          <div className="grid grid-cols-2 gap-2 p-1 rounded-2xl liquid-glass-subtle">
+            <button
+              type="button"
+              onClick={() => {
+                setAuthGateMode('register');
+                setAuthError('');
+              }}
+              className={`min-h-[38px] rounded-xl text-xs font-semibold transition-all ${
+                authGateMode === 'register'
+                  ? 'bg-stone-900 text-white shadow-sm'
+                  : 'text-stone-600 hover:text-stone-900'
+              }`}
+            >
+              Create Portal Account
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setAuthGateMode('login');
+                setAuthError('');
+              }}
+              className={`min-h-[38px] rounded-xl text-xs font-semibold transition-all ${
+                authGateMode === 'login'
+                  ? 'bg-stone-900 text-white shadow-sm'
+                  : 'text-stone-600 hover:text-stone-900'
+              }`}
+            >
+              Log In by Name / Email
+            </button>
+          </div>
+
+          <form onSubmit={handlePublicUserAuthSubmit} className="space-y-3.5">
+            <div className="space-y-1">
+              <label className="text-xs font-semibold text-stone-700 block">
+                Your Name {authGateMode === 'login' && '(or leave blank if using Email)'}
+              </label>
+              <input
+                type="text"
+                required={authGateMode === 'register'}
+                value={authName}
+                onChange={(e) => setAuthName(e.target.value)}
+                placeholder="Enter your name (saved to AI Memory)"
+                className="w-full min-h-[44px] px-3.5 py-2 rounded-2xl liquid-glass-subtle text-sm text-stone-900 focus:outline-none border border-stone-300/80"
+              />
+            </div>
+
+            <div className="space-y-1">
+              <label className="text-xs font-semibold text-stone-700 block">
+                Your Email {authGateMode === 'login' && '(optional if logging in by Name)'}
+              </label>
+              <input
+                type="email"
+                required={authGateMode === 'register'}
+                value={authEmail}
+                onChange={(e) => setAuthEmail(e.target.value)}
+                placeholder="Enter your email address"
+                className="w-full min-h-[44px] px-3.5 py-2 rounded-2xl liquid-glass-subtle text-sm text-stone-900 focus:outline-none border border-stone-300/80"
+              />
+            </div>
+
+            <div className="space-y-1">
+              <label className="text-xs font-semibold text-stone-700 block">
+                Password
+              </label>
+              <div className="relative flex items-center">
+                <input
+                  type={showAuthPassword ? 'text' : 'password'}
+                  required
+                  value={authPassword}
+                  onChange={(e) => setAuthPassword(e.target.value)}
+                  placeholder="Enter your password"
+                  className="w-full min-h-[44px] pl-3.5 pr-10 py-2 rounded-2xl liquid-glass-subtle text-sm text-stone-900 focus:outline-none border border-stone-300/80"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowAuthPassword((p) => !p)}
+                  className="absolute right-3 text-stone-500 hover:text-stone-800"
+                >
+                  {showAuthPassword ? (
+                    <EyeOff className="w-4 h-4" />
+                  ) : (
+                    <Eye className="w-4 h-4" />
+                  )}
+                </button>
+              </div>
+            </div>
+
+            {authError && (
+              <div className="p-3 rounded-2xl bg-red-500/10 border border-red-500/30 text-xs text-red-700 flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                <span>{authError}</span>
+              </div>
+            )}
+
+            <button
+              type="submit"
+              disabled={isAuthSubmitting}
+              className="w-full min-h-[46px] rounded-2xl bg-stone-900 text-white text-sm font-semibold liquid-glass-hover flex items-center justify-center gap-2"
+            >
+              <Sparkles className="w-4 h-4 text-amber-400" />
+              <span>
+                {isAuthSubmitting
+                  ? 'Opening Your Portal...'
+                  : authGateMode === 'register'
+                    ? 'Save to AI Memory & Open My Portal'
+                    : 'Unlock My Portal & Bind IP'}
+              </span>
+            </button>
+          </form>
+        </motion.div>
+      </div>
+    );
+  }
+
   return (
     <div
       className={`min-h-[100dvh] flex flex-col text-stone-900 dark:text-stone-100 relative overflow-x-hidden ${
@@ -3412,6 +4921,23 @@ export default function App() {
             })}
           </div>
         )}
+
+      {/* Official Co-Admin Announcement Banner (When Admin promotes a Co-Admin) */}
+      {Array.isArray(publicConfig.coAdminAnnouncements) &&
+        publicConfig.coAdminAnnouncements.length > 0 && (
+          <div className="relative z-30 px-4 py-2 bg-gradient-to-r from-stone-900 via-amber-900 to-stone-900 text-amber-100 text-xs sm:text-sm font-semibold text-center flex items-center justify-center gap-2 shadow-sm">
+            <Crown className="w-4 h-4 text-amber-400 shrink-0" />
+            <span>{publicConfig.coAdminAnnouncements[0].message}</span>
+          </div>
+        )}
+
+      {/* IP Auto-Login Notification Banner */}
+      {autoLoggedByIpBanner && (
+        <div className="relative z-30 px-4 py-1.5 bg-emerald-600/95 text-white text-xs font-semibold text-center flex items-center justify-center gap-2">
+          <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+          <span>{autoLoggedByIpBanner}</span>
+        </div>
+      )}
 
       {/* Live Festival Event Banner (When enabled by Admin) */}
       {publicConfig.activeFestival?.enabled &&
@@ -3476,8 +5002,33 @@ export default function App() {
           </button>
         </nav>
 
-        {/* Zone 3: 1 Primary Action Button (New Chat) */}
-        <div className="flex items-center shrink-0">
+        {/* Zone 3: User Portal Badge + Co-Admin Shortcut + New Chat */}
+        <div className="flex items-center gap-2 shrink-0">
+          {currentUser?.role === 'co-admin' && (
+            <button
+              type="button"
+              onClick={() => {
+                window.history.pushState({}, '', '/GOTadmin');
+                setIsGotAdminRoute(true);
+              }}
+              className="min-h-[38px] px-3 py-1.5 rounded-2xl bg-amber-500/20 text-amber-950 dark:text-amber-200 text-xs font-bold flex items-center gap-1.5 border border-amber-500/40"
+              title="Open Co-Admin Dashboard"
+            >
+              <Crown className="w-3.5 h-3.5 text-amber-600" />
+              <span className="hidden sm:inline">Co-Admin Panel</span>
+            </button>
+          )}
+
+          <button
+            type="button"
+            onClick={() => setShowSwitchAccountModal(true)}
+            className="min-h-[38px] px-3 py-1.5 rounded-2xl liquid-glass-subtle text-xs font-semibold text-stone-800 dark:text-stone-200 flex items-center gap-1.5"
+            title={`Signed in as ${currentUser.name} (${currentUser.email}) · IP: ${clientIp}`}
+          >
+            <UserCheck className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+            <span className="max-w-[96px] truncate">{currentUser.name}</span>
+          </button>
+
           <button
             type="button"
             onClick={handleStartNewChat}

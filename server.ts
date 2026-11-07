@@ -12,6 +12,7 @@ import {
   LiveServerMessage,
   Modality,
   ThinkingLevel,
+  Type,
 } from '@google/genai';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -42,6 +43,53 @@ export interface EnabledModulesConfig {
   crossChatMemory: boolean;
 }
 
+export interface SavedUserChatMessage {
+  id: string;
+  role: 'user' | 'agent';
+  timestamp: string;
+  agentMode?: string;
+  text: string;
+  attachedImageUrl?: string;
+  attachedImageName?: string;
+  generatedImageUrl?: string;
+  highlights?: string[];
+  visionSummary?: string;
+  sources?: GroundingSource[];
+  followUpPrompts?: string[];
+}
+
+export interface SavedUserChatSession {
+  id: string;
+  title: string;
+  updatedAt: string;
+  messages: SavedUserChatMessage[];
+}
+
+export interface PublicUserAccount {
+  id: string;
+  name: string;
+  email: string;
+  password: string;
+  ipAddress: string;
+  role: 'user' | 'co-admin';
+  isBlocked: boolean;
+  blockReason?: string;
+  violentChatCount: number;
+  createdAt: string;
+  lastLoginAt: string;
+  savedSessions: SavedUserChatSession[];
+}
+
+export interface CoAdminAnnouncement {
+  id: string;
+  userId: string;
+  userName: string;
+  userEmail: string;
+  message: string;
+  announcedAt: string;
+  active: boolean;
+}
+
 export interface AdminSystemStore {
   apiKeys: {
     geminiApiKey: string;
@@ -53,6 +101,9 @@ export interface AdminSystemStore {
   customTrainingRules: string[];
   activeFestival: FestivalConfig;
   awaitingImageApiKey: boolean;
+  users: PublicUserAccount[];
+  blockedIps: string[];
+  coAdminAnnouncements: CoAdminAnnouncement[];
   updatedAt: string;
 }
 
@@ -81,6 +132,32 @@ const TOKEN_SECRET = crypto
   .createHash('sha256')
   .update('got-agent-abhinav-secret-2026')
   .digest('hex');
+
+export function extractClientIp(req: express.Request): string {
+  const xff = req.headers['x-forwarded-for'];
+  const rawIp = Array.isArray(xff)
+    ? xff[0]
+    : typeof xff === 'string'
+    ? xff.split(',')[0].trim()
+    : req.headers['x-real-ip'] ||
+      req.socket?.remoteAddress ||
+      '127.0.0.1';
+  const cl = String(rawIp || '127.0.0.1').trim();
+  const clientHintIp = String(req.headers['x-got-client-ip'] || '').trim();
+  if (clientHintIp && clientHintIp !== 'unknown') {
+    return clientHintIp;
+  }
+  return cl.replace(/^::ffff:/, '') || '127.0.0.1';
+}
+
+const VIOLENT_CHAT_REGEX =
+  /\b(kill\s+(you|him|her|them|myself|everyone|people)|murder|assassinate|massacre|slaughter|shoot\s+(up|people|him|her|them)|stab\s+(him|her|them|people)|bomb\s+(attack|making|school|city|building)|make\s+a\s+bomb|terrorist\s+attack|behead|torture\s+(people|him|her)|rape|sexual\s+assault|commit\s+suicide|how\s+to\s+kill|bloodbath|genocide|school\s+shooting|acid\s+attack)\b/i;
+
+export function isViolentChatMessage(text: string): boolean {
+  const clean = String(text || '').trim();
+  if (!clean) return false;
+  return VIOLENT_CHAT_REGEX.test(clean);
+}
 
 function createDefaultStore(): AdminSystemStore {
   return {
@@ -113,6 +190,9 @@ function createDefaultStore(): AdminSystemStore {
       enabled: false,
     },
     awaitingImageApiKey: false,
+    users: [],
+    blockedIps: [],
+    coAdminAnnouncements: [],
     updatedAt: new Date().toISOString(),
   };
 }
@@ -138,6 +218,11 @@ function loadAdminStore(): AdminSystemStore {
           ...defaults.activeFestival,
           ...(parsed.activeFestival || {}),
         },
+        users: Array.isArray(parsed.users) ? parsed.users : [],
+        blockedIps: Array.isArray(parsed.blockedIps) ? parsed.blockedIps : [],
+        coAdminAnnouncements: Array.isArray(parsed.coAdminAnnouncements)
+          ? parsed.coAdminAnnouncements
+          : [],
         awaitingImageApiKey: Boolean(
           parsed.awaitingImageApiKey ||
             parsed.pendingAdminAction === 'awaiting_image_api_key'
@@ -188,6 +273,9 @@ function saveAdminStore(store: AdminSystemStore) {
     {
       enabledModules: store.enabledModules,
       activeFestival: store.activeFestival,
+      coAdminAnnouncements: (store.coAdminAnnouncements || []).filter(
+        (a) => a.active
+      ),
       updatedAt: store.updatedAt,
     },
     null,
@@ -207,7 +295,6 @@ function saveAdminStore(store: AdminSystemStore) {
 }
 
 let adminStore: AdminSystemStore = loadAdminStore();
-// Ensure initial public/site-config.json and got-admin-store.json exist on startup
 saveAdminStore(adminStore);
 
 function getActiveGeminiKey(): string {
@@ -241,6 +328,22 @@ function maskKey(key: string): string {
   return `${clean.slice(0, 7)}••••••••••••${clean.slice(-4)}`;
 }
 
+function sanitizePublicUser(u: PublicUserAccount) {
+  return {
+    id: u.id,
+    name: u.name,
+    email: u.email,
+    ipAddress: u.ipAddress,
+    role: u.role,
+    isBlocked: u.isBlocked,
+    blockReason: u.blockReason || '',
+    violentChatCount: u.violentChatCount || 0,
+    createdAt: u.createdAt,
+    lastLoginAt: u.lastLoginAt,
+    savedSessions: Array.isArray(u.savedSessions) ? u.savedSessions : [],
+  };
+}
+
 function buildAdminStatePayload() {
   const geminiVal = getActiveGeminiKey();
   const openRouterVal = getActiveOpenRouterKey();
@@ -253,6 +356,9 @@ function buildAdminStatePayload() {
     enabledModules: adminStore.enabledModules,
     activeFestival: adminStore.activeFestival,
     customTrainingRules: adminStore.customTrainingRules,
+    users: adminStore.users || [],
+    blockedIps: adminStore.blockedIps || [],
+    coAdminAnnouncements: adminStore.coAdminAnnouncements || [],
     updatedAt: adminStore.updatedAt,
     apiKeysInventory: [
       {
@@ -273,7 +379,8 @@ function buildAdminStatePayload() {
         fullValue: geminiVal,
         configured: Boolean(geminiVal),
         status: geminiVal ? 'ACTIVE · CONNECTED' : 'SYSTEM DEFAULT',
-        purpose: 'Powers Deep Reasoning, Google Search Grounding, and Vision OCR',
+        purpose:
+          'Powers Auto Event/Animation Generation in Admin Dashboard, Deep Reasoning, Google Search Grounding & Vision OCR',
       },
       {
         id: 'IMAGE_GEN_API_KEY',
@@ -303,7 +410,7 @@ function buildAdminStatePayload() {
 
 function signAdminToken(email: string): string {
   const exp = Date.now() + 7 * 24 * 60 * 60 * 1000;
-  const payload = `${email}|${exp}`;
+  const payload = `${email.toLowerCase()}|${exp}`;
   const sig = crypto
     .createHmac('sha256', TOKEN_SECRET)
     .update(payload)
@@ -317,19 +424,242 @@ function verifyAdminToken(token?: string): boolean {
     const decoded = Buffer.from(token, 'base64url').toString('utf-8');
     const [email, expStr, sig] = decoded.split('|');
     if (!email || !expStr || !sig) return false;
-    if (email.toLowerCase() !== ADMIN_EMAIL) return false;
     if (Date.now() > Number(expStr)) return false;
     const expectedSig = crypto
       .createHmac('sha256', TOKEN_SECRET)
       .update(`${email}|${expStr}`)
       .digest('hex');
-    return crypto.timingSafeEqual(
+    const validSig = crypto.timingSafeEqual(
       Buffer.from(sig),
       Buffer.from(expectedSig)
     );
+    if (!validSig) return false;
+    if (email.toLowerCase() === ADMIN_EMAIL) return true;
+    // Also allow active Co-Admins to access Admin Panel
+    const isCoAdmin = (adminStore.users || []).some(
+      (u) =>
+        u.email.toLowerCase() === email.toLowerCase() &&
+        u.role === 'co-admin' &&
+        !u.isBlocked
+    );
+    return isCoAdmin;
   } catch {
     return false;
   }
+}
+
+/**
+ * Uses the Gemini API key configured in the Admin Dashboard to automatically generate
+ * custom website event themes, floating particle animations, and hover effects when
+ * the Admin tells the AI in /GOTadmin to add any event or animation.
+ */
+async function generateDynamicEventAnimationWithGemini(
+  adminCommand: string
+): Promise<{
+  festival: FestivalConfig;
+  trainingRule: string;
+  reply: string;
+}> {
+  const lower = adminCommand.toLowerCase();
+
+  // Try using Gemini API with the Admin Dashboard Gemini API Key first
+  const activeGemKey = getActiveGeminiKey();
+  if (activeGemKey) {
+    try {
+      const ai = getGenAIClient(10000);
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.8-flash',
+        contents: `The website administrator entered this command in the GOT Agent Admin Dashboard: "${adminCommand}".
+Design a complete, vibrant live website event & UI animation package for this request.
+Return JSON matching the schema.`,
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              themeStyle: {
+                type: Type.STRING,
+                description:
+                  'One of: "diwali", "holi", "newyear", or "custom" depending on the vibe.',
+              },
+              eventName: {
+                type: Type.STRING,
+                description: 'Display name of the event or animation theme.',
+              },
+              bannerText: {
+                type: Type.STRING,
+                description:
+                  'Exciting top banner announcement text with emojis for the public website (mention GOT Agent created by Abhinav).',
+              },
+              primaryAccent: {
+                type: Type.STRING,
+                description: 'Primary hex color code, e.g. #f59e0b or #ec4899.',
+              },
+              secondaryAccent: {
+                type: Type.STRING,
+                description:
+                  'Secondary hex color code, e.g. #ea580c or #8b5cf6.',
+              },
+              hoverEffect: {
+                type: Type.STRING,
+                description:
+                  'One of: "glow", "bounce", or "sparkle" for card and button hover animations.',
+              },
+              particles: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+                description:
+                  '5 to 6 festive emojis or symbols that will float and animate across the website screen.',
+              },
+              aiGreetingRule: {
+                type: Type.STRING,
+                description:
+                  'Instruction for GOT Agent AI on how to greet or assist users during this event.',
+              },
+            },
+            required: [
+              'themeStyle',
+              'eventName',
+              'bannerText',
+              'primaryAccent',
+              'secondaryAccent',
+              'hoverEffect',
+              'particles',
+              'aiGreetingRule',
+            ],
+          },
+        },
+      });
+
+      const parsed = JSON.parse((response.text ?? '{}').trim());
+      if (parsed && parsed.eventName) {
+        const validId: 'diwali' | 'holi' | 'newyear' | 'custom' =
+          parsed.themeStyle === 'diwali' ||
+          parsed.themeStyle === 'holi' ||
+          parsed.themeStyle === 'newyear'
+            ? parsed.themeStyle
+            : /\bdiwali|deepavali\b/i.test(lower)
+            ? 'diwali'
+            : /\bholi\b/i.test(lower)
+            ? 'holi'
+            : 'custom';
+
+        const validHover: 'glow' | 'bounce' | 'sparkle' =
+          parsed.hoverEffect === 'bounce' || parsed.hoverEffect === 'sparkle'
+            ? parsed.hoverEffect
+            : 'glow';
+
+        const particlesArr =
+          Array.isArray(parsed.particles) && parsed.particles.length > 0
+            ? parsed.particles.slice(0, 6).map(String)
+            : ['✨', '🎉', '🌟', '💫', '🎊'];
+
+        const festival: FestivalConfig = {
+          id: validId,
+          name: String(parsed.eventName),
+          bannerText: String(parsed.bannerText),
+          primaryAccent: String(parsed.primaryAccent || '#f59e0b'),
+          secondaryAccent: String(parsed.secondaryAccent || '#ea580c'),
+          hoverEffect: validHover,
+          particles: particlesArr,
+          enabled: true,
+        };
+
+        return {
+          festival,
+          trainingRule: String(
+            parsed.aiGreetingRule ||
+              `The website is currently celebrating ${festival.name}. Greet users warmly!`
+          ),
+          reply: `✨ **Gemini AI Auto-Generated Event & Website Animations Activated!**\n\n• **Event Theme**: **${festival.name}** (Generated live via Admin Gemini API Key)\n• **Live Public Banner**: *"${festival.bannerText}"*\n• **Floating Screen Animations**: ${festival.particles.join(
+            ' '
+          )}\n• **Interactive Hover Animation**: \`${festival.hoverEffect.toUpperCase()}\` physics with \`${
+            festival.primaryAccent
+          }\` → \`${festival.secondaryAccent}\` accent aura\n• **AI Memory Updated**: GOT Agent will now greet users for **${
+            festival.name
+          }**!`,
+        };
+      }
+    } catch (err) {
+      console.error('Gemini dynamic event generation fallback:', err);
+    }
+  }
+
+  // Deterministic smart fallback if Gemini API call times out
+  if (/\b(diwali|deepavali)\b/i.test(lower)) {
+    const festival: FestivalConfig = {
+      id: 'diwali',
+      name: 'Diwali Festival of Lights',
+      bannerText:
+        '🪔 Happy Diwali! Celebrate the Festival of Lights with GOT Agent (Created by Abhinav) ✨',
+      primaryAccent: '#f59e0b',
+      secondaryAccent: '#ea580c',
+      hoverEffect: 'glow',
+      particles: ['🪔', '✨', '🎆', '🎇', '🌸'],
+      enabled: true,
+    };
+    return {
+      festival,
+      trainingRule:
+        'The website is currently celebrating Diwali (Festival of Lights). Greet users warmly with Happy Diwali wishes!',
+      reply: `🪔 **Diwali Festival Event & UI Animations Activated on Public Website!**\n\n• **Live Banner**: *"${festival.bannerText}"*\n• **Floating Animations**: ${festival.particles.join(
+        ' '
+      )}\n• **Hover Physics**: Golden Specular Glow applied to all Liquid Glass cards and buttons!`,
+    };
+  }
+
+  if (/\b(holi)\b/i.test(lower)) {
+    const festival: FestivalConfig = {
+      id: 'holi',
+      name: 'Holi Festival of Colors',
+      bannerText:
+        '🎨 Happy Holi! Celebrate Vibrant Colors & Joy with GOT Agent (Created by Abhinav) 🌈',
+      primaryAccent: '#ec4899',
+      secondaryAccent: '#8b5cf6',
+      hoverEffect: 'bounce',
+      particles: ['🎨', '🌈', '✨', '🌸', '🎊'],
+      enabled: true,
+    };
+    return {
+      festival,
+      trainingRule:
+        'The website is currently celebrating Holi (Festival of Colors). Share vibrant, joyful greetings!',
+      reply: `🎨 **Holi Festival Event & Color Animations Activated on Public Website!**\n\n• **Live Banner**: *"${festival.bannerText}"*\n• **Floating Animations**: ${festival.particles.join(
+        ' '
+      )}\n• **Hover Physics**: Elastic Bounce Hover applied to all Liquid Glass elements!`,
+    };
+  }
+
+  const cleanedName = adminCommand
+    .replace(
+      /\b(please|add|create|enable|start|run|event|festival|animation|animations|of|for|in|website|ui|hover|with|and|to|ai)\b/gi,
+      ' '
+    )
+    .replace(/\s+/g, ' ')
+    .trim();
+  const title = cleanedName
+    ? cleanedName.charAt(0).toUpperCase() + cleanedName.slice(1)
+    : 'Special Live Celebration';
+
+  const festival: FestivalConfig = {
+    id: 'custom',
+    name: `${title} Event`,
+    bannerText: `🎉 Celebrating ${title} Live on GOT Agent (Created by Abhinav)! ✨`,
+    primaryAccent: '#f59e0b',
+    secondaryAccent: '#3b82f6',
+    hoverEffect: 'bounce',
+    particles: ['✨', '🎉', '🌟', '🎊', '💫'],
+    enabled: true,
+  };
+
+  return {
+    festival,
+    trainingRule: `The website is currently running the "${title}" event and animation theme. Mention it warmly when greeting users!`,
+    reply: `🎉 **${festival.name} & Live Website Animations Activated!**\n\n• **Live Banner**: *"${festival.bannerText}"*\n• **Floating Screen Animations**: ${festival.particles.join(
+      ' '
+    )}\n• **Hover Physics**: Interactive Bounce & Glow animations active across the public website!`,
+  };
 }
 
 /**
@@ -600,7 +930,7 @@ export function buildKnowledgeFallback(
     )
   ) {
     return {
-      reply: `I am **GOT Agent** (running on **${agentMode}**), and I was created by **Abhinav**.\n\nAbhinav designed me with a Bubble Liquid Glass interface, real-time Live Voice conversation right in the input bar, Code Generation Studio, permanent cross-chat memory, Google Search grounding, and instant Image Vision OCR.\n\nHow can I help you today?`,
+      reply: `I am **GOT Agent** (running on **${agentMode}**), and I was created by **Abhinav**.\n\nAbhinav designed me with a Bubble Liquid Glass interface, real-time Live Voice conversation right in the input bar, Code Generation Studio, permanent account & cross-chat memory, Google Search grounding, and instant Image Vision OCR.\n\nHow can I help you today?`,
       highlights: [
         'Creator: Abhinav',
         `Model: ${agentMode}`,
@@ -661,13 +991,282 @@ async function startServer() {
     next();
   });
 
-  // Public Site Config Endpoint (Always reads freshest state from disk/memory — zero admin info!)
-  app.get('/api/public/site-config', (_req, res) => {
+  // Public Site Config Endpoint (Always reads freshest state from disk/memory — zero admin credentials!)
+  app.get('/api/public/site-config', (req, res) => {
     adminStore = loadAdminStore();
+    const clientIp = extractClientIp(req);
+    const isIpBlocked =
+      (adminStore.blockedIps || []).includes(clientIp) ||
+      (adminStore.users || []).some(
+        (u) => u.ipAddress === clientIp && u.isBlocked
+      );
+
     res.json({
       enabledModules: adminStore.enabledModules,
       activeFestival: adminStore.activeFestival,
+      coAdminAnnouncements: (adminStore.coAdminAnnouncements || []).filter(
+        (a) => a.active
+      ),
+      clientIp,
+      isIpBlocked,
       updatedAt: adminStore.updatedAt,
+    });
+  });
+
+  // ============================================================================
+  // PUBLIC USER ACCOUNT PORTAL, IP AUTO-LOGIN & CHAT SYNC ENDPOINTS
+  // ============================================================================
+
+  // 1. Check current visitor IP & auto-open user portal if IP matches an existing account
+  app.get('/api/public/user-session', (req, res) => {
+    adminStore = loadAdminStore();
+    const clientIp = extractClientIp(req);
+    const requestedUserId = String(req.query.userId || '').trim();
+
+    const blockedUserByIp = (adminStore.users || []).find(
+      (u) => u.ipAddress === clientIp && u.isBlocked
+    );
+    const isIpInBlockedList = (adminStore.blockedIps || []).includes(clientIp);
+
+    if (isIpInBlockedList || blockedUserByIp) {
+      res.status(403).json({
+        blocked: true,
+        clientIp,
+        reason:
+          blockedUserByIp?.blockReason ||
+          'Your IP address and account have been blocked due to policy violations (>5 violent chats or Admin block).',
+      });
+      return;
+    }
+
+    // First check explicit userId if provided, otherwise match by IP address for instant auto-open portal
+    let matchedUser = requestedUserId
+      ? (adminStore.users || []).find((u) => u.id === requestedUserId)
+      : undefined;
+
+    if (!matchedUser && clientIp) {
+      // Find most recently logged-in user matching this IP address
+      const ipMatches = (adminStore.users || []).filter(
+        (u) => u.ipAddress === clientIp && !u.isBlocked
+      );
+      if (ipMatches.length > 0) {
+        matchedUser = ipMatches.sort((a, b) =>
+          String(b.lastLoginAt || '').localeCompare(String(a.lastLoginAt || ''))
+        )[0];
+      }
+    }
+
+    if (matchedUser && matchedUser.isBlocked) {
+      res.status(403).json({
+        blocked: true,
+        clientIp,
+        reason:
+          matchedUser.blockReason ||
+          'This user account and IP address have been blocked by Admin.',
+      });
+      return;
+    }
+
+    res.json({
+      blocked: false,
+      clientIp,
+      autoMatchedByIp: Boolean(matchedUser && !requestedUserId),
+      user: matchedUser ? sanitizePublicUser(matchedUser) : null,
+      coAdminAnnouncements: (adminStore.coAdminAnnouncements || []).filter(
+        (a) => a.active
+      ),
+    });
+  });
+
+  // 2. Register or Sign In User on Public Website (Saves Name, Email, Password, IP Address & syncs to Admin Panel + AI Memory)
+  app.post('/api/public/user-auth', (req, res) => {
+    adminStore = loadAdminStore();
+    const clientIp = extractClientIp(req);
+    const mode = String(req.body?.mode || 'register')
+      .trim()
+      .toLowerCase();
+    const rawName = String(req.body?.name || '').trim();
+    const rawEmail = String(req.body?.email || '')
+      .trim()
+      .toLowerCase();
+    const rawPassword = String(req.body?.password || '').trim();
+    const initialSessions = Array.isArray(req.body?.savedSessions)
+      ? req.body.savedSessions
+      : [];
+
+    if ((adminStore.blockedIps || []).includes(clientIp)) {
+      res.status(403).json({
+        blocked: true,
+        error: `Access Denied: Your IP address (${clientIp}) is blocked from accessing GOT Agent.`,
+      });
+      return;
+    }
+
+    if (mode === 'login') {
+      // User can log in by Name or Email + Password
+      const identifier = (rawName || rawEmail).toLowerCase();
+      if (!identifier || !rawPassword) {
+        res.status(400).json({
+          error: 'Please enter your Name (or Email) and Password to log in.',
+        });
+        return;
+      }
+
+      const existing = (adminStore.users || []).find(
+        (u) =>
+          (u.name.toLowerCase() === identifier ||
+            u.email.toLowerCase() === identifier) &&
+          u.password === rawPassword
+      );
+
+      if (!existing) {
+        res.status(401).json({
+          error:
+            'Invalid Name/Email or Password. Please check your credentials or create a new account.',
+        });
+        return;
+      }
+
+      if (existing.isBlocked) {
+        res.status(403).json({
+          blocked: true,
+          error:
+            existing.blockReason ||
+            'Your account and IP address have been blocked by Admin.',
+        });
+        return;
+      }
+
+      // Save current IP address on login so future visits from this IP auto-open their portal!
+      existing.ipAddress = clientIp;
+      existing.lastLoginAt = new Date().toISOString();
+      saveAdminStore(adminStore);
+
+      res.json({
+        authenticated: true,
+        clientIp,
+        user: sanitizePublicUser(existing),
+      });
+      return;
+    }
+
+    // Registration mode (Create Account or instant upsert if same email+password)
+    if (!rawName || !rawEmail || !rawPassword) {
+      res.status(400).json({
+        error: 'Please enter your Name, Email, and Password to open your portal.',
+      });
+      return;
+    }
+
+    const existingByEmail = (adminStore.users || []).find(
+      (u) => u.email.toLowerCase() === rawEmail
+    );
+
+    if (existingByEmail) {
+      if (existingByEmail.isBlocked) {
+        res.status(403).json({
+          blocked: true,
+          error:
+            existingByEmail.blockReason ||
+            'This account has been blocked by Admin.',
+        });
+        return;
+      }
+      if (existingByEmail.password !== rawPassword) {
+        res.status(401).json({
+          error:
+            'An account with this email already exists. Please enter the correct password or switch to Sign In.',
+        });
+        return;
+      }
+      existingByEmail.name = rawName || existingByEmail.name;
+      existingByEmail.ipAddress = clientIp;
+      existingByEmail.lastLoginAt = new Date().toISOString();
+      saveAdminStore(adminStore);
+
+      res.json({
+        authenticated: true,
+        clientIp,
+        user: sanitizePublicUser(existingByEmail),
+      });
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+    const newUser: PublicUserAccount = {
+      id: `user-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      name: rawName,
+      email: rawEmail,
+      password: rawPassword,
+      ipAddress: clientIp,
+      role: 'user',
+      isBlocked: false,
+      violentChatCount: 0,
+      createdAt: nowIso,
+      lastLoginAt: nowIso,
+      savedSessions: initialSessions,
+    };
+
+    adminStore.users = [newUser, ...(adminStore.users || [])];
+    saveAdminStore(adminStore);
+
+    res.json({
+      authenticated: true,
+      clientIp,
+      user: sanitizePublicUser(newUser),
+    });
+  });
+
+  // 3. Save / Sync User's Conversation History to their Account
+  app.post('/api/public/user-sync-chats', (req, res) => {
+    adminStore = loadAdminStore();
+    const userId = String(req.body?.userId || '').trim();
+    const sessions = Array.isArray(req.body?.sessions) ? req.body.sessions : [];
+
+    if (!userId) {
+      res.status(400).json({ error: 'Missing userId' });
+      return;
+    }
+
+    const target = (adminStore.users || []).find((u) => u.id === userId);
+    if (!target) {
+      res.status(404).json({ error: 'User not found' });
+      return;
+    }
+
+    if (target.isBlocked) {
+      res.status(403).json({
+        blocked: true,
+        error: target.blockReason || 'Account blocked',
+      });
+      return;
+    }
+
+    // Keep compact clean sessions in account storage
+    target.savedSessions = sessions.slice(0, 25).map((s: any) => ({
+      id: String(s.id || `session-${Date.now()}`),
+      title: String(s.title || 'Chat with GOT Agent'),
+      updatedAt: String(s.updatedAt || 'Just now'),
+      messages: Array.isArray(s.messages)
+        ? s.messages.slice(-30).map((m: any) => ({
+            id: String(m.id || ''),
+            role: m.role === 'user' ? 'user' : 'agent',
+            timestamp: String(m.timestamp || ''),
+            agentMode: m.agentMode,
+            text: String(m.text || ''),
+            highlights: Array.isArray(m.highlights) ? m.highlights : [],
+            sources: Array.isArray(m.sources) ? m.sources : [],
+            followUpPrompts: Array.isArray(m.followUpPrompts)
+              ? m.followUpPrompts
+              : [],
+          }))
+        : [],
+    }));
+    saveAdminStore(adminStore);
+
+    res.json({
+      success: true,
+      user: sanitizePublicUser(target),
     });
   });
 
@@ -675,6 +1274,7 @@ async function startServer() {
   // 100% SECURE ADMIN PANEL ENDPOINTS (/api/gotadmin/*)
   // ============================================================================
   app.post('/api/gotadmin/login', (req, res) => {
+    adminStore = loadAdminStore();
     const rawEmail = String(req.body?.email || '')
       .trim()
       .toLowerCase();
@@ -685,23 +1285,35 @@ async function startServer() {
       .update(`${rawPass}:got-admin-salt`)
       .digest('hex');
 
-    if (
+    const isPrimaryAdmin =
       rawEmail === ADMIN_EMAIL &&
-      (passHash === ADMIN_PASS_HASH || rawPass === ADMIN_PASS_PLAIN)
-    ) {
-      adminStore = loadAdminStore();
-      const token = signAdminToken(ADMIN_EMAIL);
+      (passHash === ADMIN_PASS_HASH || rawPass === ADMIN_PASS_PLAIN);
+
+    const matchedCoAdmin = (adminStore.users || []).find(
+      (u) =>
+        u.email.toLowerCase() === rawEmail &&
+        u.password === rawPass &&
+        u.role === 'co-admin' &&
+        !u.isBlocked
+    );
+
+    if (isPrimaryAdmin || matchedCoAdmin) {
+      const loginIdentity = isPrimaryAdmin
+        ? ADMIN_EMAIL
+        : matchedCoAdmin!.email;
+      const token = signAdminToken(loginIdentity);
       res.json({
         authenticated: true,
         token,
-        adminEmail: ADMIN_EMAIL,
+        adminEmail: loginIdentity,
+        isCoAdmin: Boolean(matchedCoAdmin && !isPrimaryAdmin),
         state: buildAdminStatePayload(),
       });
     } else {
       res.status(401).json({
         authenticated: false,
         error:
-          'Invalid admin email or password. Use abhinavstudents79@gmail.com and your admin password.',
+          'Invalid admin email or password. Use abhinavstudents79@gmail.com (or an active Co-Admin account) and your password.',
       });
     }
   });
@@ -734,10 +1346,264 @@ async function startServer() {
     });
   });
 
+  // Admin User Management Endpoint: Add User, Announce Co-Admin, Block/Unblock User & IP, Delete User
+  app.post('/api/gotadmin/users-action', requireAdminAuth, (req, res) => {
+    adminStore = loadAdminStore();
+    const {
+      action,
+      userId,
+      name,
+      email,
+      password,
+      ipAddress,
+      role,
+      blockReason,
+    } = req.body || {};
+
+    if (action === 'add_user') {
+      const cleanName = String(name || '').trim();
+      const cleanEmail = String(email || '')
+        .trim()
+        .toLowerCase();
+      const cleanPass = String(password || '').trim();
+      const cleanIp = String(ipAddress || '').trim() || 'Auto-Detect on Login';
+      const targetRole: 'user' | 'co-admin' =
+        role === 'co-admin' ? 'co-admin' : 'user';
+
+      if (!cleanName || !cleanEmail || !cleanPass) {
+        res.status(400).json({
+          error: 'Name, Email, and Password are required to add a user.',
+        });
+        return;
+      }
+
+      const existingIdx = (adminStore.users || []).findIndex(
+        (u) => u.email.toLowerCase() === cleanEmail
+      );
+
+      const nowIso = new Date().toISOString();
+      let createdOrUpdatedUser: PublicUserAccount;
+
+      if (existingIdx >= 0) {
+        adminStore.users[existingIdx] = {
+          ...adminStore.users[existingIdx],
+          name: cleanName,
+          password: cleanPass,
+          ipAddress:
+            cleanIp !== 'Auto-Detect on Login'
+              ? cleanIp
+              : adminStore.users[existingIdx].ipAddress,
+          role: targetRole,
+          isBlocked: false,
+        };
+        createdOrUpdatedUser = adminStore.users[existingIdx];
+      } else {
+        createdOrUpdatedUser = {
+          id: `user-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          name: cleanName,
+          email: cleanEmail,
+          password: cleanPass,
+          ipAddress: cleanIp,
+          role: targetRole,
+          isBlocked: false,
+          violentChatCount: 0,
+          createdAt: nowIso,
+          lastLoginAt: nowIso,
+          savedSessions: [],
+        };
+        adminStore.users = [createdOrUpdatedUser, ...(adminStore.users || [])];
+      }
+
+      if (targetRole === 'co-admin') {
+        const announcement: CoAdminAnnouncement = {
+          id: `ann-${Date.now()}`,
+          userId: createdOrUpdatedUser.id,
+          userName: createdOrUpdatedUser.name,
+          userEmail: createdOrUpdatedUser.email,
+          message: `📢 Official Announcement: Admin Abhinav has appointed ${createdOrUpdatedUser.name} (${createdOrUpdatedUser.email}) as an official Co-Admin of GOT Agent!`,
+          announcedAt: new Date().toLocaleTimeString([], {
+            hour: '2-digit',
+            minute: '2-digit',
+          }),
+          active: true,
+        };
+        adminStore.coAdminAnnouncements = [
+          announcement,
+          ...(adminStore.coAdminAnnouncements || []).filter(
+            (a) => a.userId !== createdOrUpdatedUser.id
+          ),
+        ];
+        adminStore.customTrainingRules.push(
+          `${createdOrUpdatedUser.name} (${createdOrUpdatedUser.email}) has been officially announced as a Co-Admin of GOT Agent by Admin Abhinav.`
+        );
+      }
+
+      saveAdminStore(adminStore);
+      res.json({
+        success: true,
+        message:
+          targetRole === 'co-admin'
+            ? `Added ${cleanName} as Co-Admin and published official announcement on the website!`
+            : `Added user ${cleanName} (${cleanEmail})!`,
+        state: buildAdminStatePayload(),
+      });
+      return;
+    }
+
+    if (action === 'toggle_coadmin') {
+      const target = (adminStore.users || []).find((u) => u.id === userId);
+      if (!target) {
+        res.status(404).json({ error: 'User not found.' });
+        return;
+      }
+
+      const nextRole: 'user' | 'co-admin' =
+        target.role === 'co-admin' ? 'user' : 'co-admin';
+      target.role = nextRole;
+
+      if (nextRole === 'co-admin') {
+        const announcement: CoAdminAnnouncement = {
+          id: `ann-${Date.now()}`,
+          userId: target.id,
+          userName: target.name,
+          userEmail: target.email,
+          message: `📢 Official Announcement: Admin Abhinav has appointed ${target.name} as an official Co-Admin of GOT Agent!`,
+          announcedAt: new Date().toLocaleTimeString([], {
+            hour: '2-digit',
+            minute: '2-digit',
+          }),
+          active: true,
+        };
+        adminStore.coAdminAnnouncements = [
+          announcement,
+          ...(adminStore.coAdminAnnouncements || []).filter(
+            (a) => a.userId !== target.id
+          ),
+        ];
+        adminStore.customTrainingRules.push(
+          `${target.name} (${target.email}) is an official Co-Admin of GOT Agent appointed by Abhinav.`
+        );
+      } else {
+        adminStore.coAdminAnnouncements = (
+          adminStore.coAdminAnnouncements || []
+        ).filter((a) => a.userId !== target.id);
+      }
+
+      saveAdminStore(adminStore);
+      res.json({
+        success: true,
+        message:
+          nextRole === 'co-admin'
+            ? `👑 Announced ${target.name} as Co-Admin across the public website!`
+            : `Updated ${target.name} role to standard User.`,
+        state: buildAdminStatePayload(),
+      });
+      return;
+    }
+
+    if (action === 'toggle_block') {
+      const target = (adminStore.users || []).find((u) => u.id === userId);
+      if (!target) {
+        res.status(404).json({ error: 'User not found.' });
+        return;
+      }
+
+      target.isBlocked = !target.isBlocked;
+      if (target.isBlocked) {
+        target.blockReason =
+          blockReason ||
+          'Blocked by Admin Abhinav from accessing GOT Agent.';
+        if (
+          target.ipAddress &&
+          target.ipAddress !== 'Auto-Detect on Login' &&
+          !adminStore.blockedIps.includes(target.ipAddress)
+        ) {
+          adminStore.blockedIps.push(target.ipAddress);
+        }
+      } else {
+        target.blockReason = '';
+        target.violentChatCount = 0;
+        adminStore.blockedIps = (adminStore.blockedIps || []).filter(
+          (ip) => ip !== target.ipAddress
+        );
+      }
+
+      saveAdminStore(adminStore);
+      res.json({
+        success: true,
+        message: target.isBlocked
+          ? `🚫 Blocked user ${target.name} and IP (${target.ipAddress})!`
+          : `✅ Unblocked user ${target.name} and IP (${target.ipAddress}) and reset violation strikes!`,
+        state: buildAdminStatePayload(),
+      });
+      return;
+    }
+
+    if (action === 'unblock_ip') {
+      const ipToClear = String(ipAddress || '').trim();
+      adminStore.blockedIps = (adminStore.blockedIps || []).filter(
+        (ip) => ip !== ipToClear
+      );
+      (adminStore.users || []).forEach((u) => {
+        if (u.ipAddress === ipToClear) {
+          u.isBlocked = false;
+          u.violentChatCount = 0;
+          u.blockReason = '';
+        }
+      });
+      saveAdminStore(adminStore);
+      res.json({
+        success: true,
+        message: `✅ Unblocked IP address ${ipToClear}!`,
+        state: buildAdminStatePayload(),
+      });
+      return;
+    }
+
+    if (action === 'delete_user') {
+      adminStore.users = (adminStore.users || []).filter(
+        (u) => u.id !== userId
+      );
+      adminStore.coAdminAnnouncements = (
+        adminStore.coAdminAnnouncements || []
+      ).filter((a) => a.userId !== userId);
+      saveAdminStore(adminStore);
+      res.json({
+        success: true,
+        message: 'Removed user account.',
+        state: buildAdminStatePayload(),
+      });
+      return;
+    }
+
+    if (action === 'dismiss_announcement') {
+      const annId = String(req.body?.announcementId || '');
+      adminStore.coAdminAnnouncements = (
+        adminStore.coAdminAnnouncements || []
+      ).filter((a) => a.id !== annId);
+      saveAdminStore(adminStore);
+      res.json({
+        success: true,
+        message: 'Removed Co-Admin announcement banner.',
+        state: buildAdminStatePayload(),
+      });
+      return;
+    }
+
+    res.status(400).json({ error: 'Unknown user management action.' });
+  });
+
   // Update API keys, modules, festival theme, or training rules directly from Admin Panel controls
   app.post('/api/gotadmin/update', requireAdminAuth, (req, res) => {
-    const { apiKeys, enabledModules, customTrainingRules, activeFestival } =
-      req.body || {};
+    const {
+      apiKeys,
+      enabledModules,
+      customTrainingRules,
+      activeFestival,
+      users,
+      blockedIps,
+      coAdminAnnouncements,
+    } = req.body || {};
 
     if (apiKeys && typeof apiKeys === 'object') {
       if (typeof apiKeys.geminiApiKey === 'string') {
@@ -778,6 +1644,16 @@ async function startServer() {
       };
     }
 
+    if (Array.isArray(users)) {
+      adminStore.users = users;
+    }
+    if (Array.isArray(blockedIps)) {
+      adminStore.blockedIps = blockedIps;
+    }
+    if (Array.isArray(coAdminAnnouncements)) {
+      adminStore.coAdminAnnouncements = coAdminAnnouncements;
+    }
+
     saveAdminStore(adminStore);
     res.json({
       success: true,
@@ -787,6 +1663,7 @@ async function startServer() {
 
   // Admin AI Trainer & Natural Language Command Interpreter (/GOTadmin Chat)
   app.post('/api/gotadmin/ai-command', requireAdminAuth, async (req, res) => {
+    adminStore = loadAdminStore();
     const command = String(req.body?.command || '').trim();
     const lower = command.toLowerCase();
 
@@ -836,7 +1713,79 @@ async function startServer() {
       return;
     }
 
-    // 2. Admin asks to add AI Image Generator ("add in ur self ai image generator")
+    // 2. Admin asks via AI Trainer to block/unblock a user or promote a Co-Admin
+    const blockMatch = command.match(
+      /\b(block|ban)\s+(?:user\s+)?([a-zA-Z0-9@._\-]+)\b/i
+    );
+    if (blockMatch) {
+      const targetQuery = blockMatch[2].toLowerCase();
+      const targetUser = (adminStore.users || []).find(
+        (u) =>
+          u.name.toLowerCase().includes(targetQuery) ||
+          u.email.toLowerCase().includes(targetQuery) ||
+          u.ipAddress === targetQuery
+      );
+      if (targetUser) {
+        targetUser.isBlocked = true;
+        targetUser.blockReason = 'Blocked by Admin via AI Trainer command';
+        if (
+          targetUser.ipAddress &&
+          !adminStore.blockedIps.includes(targetUser.ipAddress)
+        ) {
+          adminStore.blockedIps.push(targetUser.ipAddress);
+        }
+        saveAdminStore(adminStore);
+        res.json({
+          reply: `🚫 **User & IP Blocked!**\n\nI have blocked **${targetUser.name}** (\`${targetUser.email}\`) and their IP address (\`${targetUser.ipAddress}\`). They can no longer access the public website.`,
+          state: buildAdminStatePayload(),
+        });
+        return;
+      }
+    }
+
+    const coAdminMatch = command.match(
+      /\b(make|announce|set|promote)\s+(?:user\s+)?([a-zA-Z0-9@._\-]+)\s+(?:as\s+)?(?:a\s+)?co[\s\-]?admin/i
+    );
+    if (coAdminMatch) {
+      const targetQuery = coAdminMatch[2].toLowerCase();
+      const targetUser = (adminStore.users || []).find(
+        (u) =>
+          u.name.toLowerCase().includes(targetQuery) ||
+          u.email.toLowerCase().includes(targetQuery)
+      );
+      if (targetUser) {
+        targetUser.role = 'co-admin';
+        const announcement: CoAdminAnnouncement = {
+          id: `ann-${Date.now()}`,
+          userId: targetUser.id,
+          userName: targetUser.name,
+          userEmail: targetUser.email,
+          message: `📢 Official Announcement: Admin Abhinav has appointed ${targetUser.name} as an official Co-Admin of GOT Agent!`,
+          announcedAt: new Date().toLocaleTimeString([], {
+            hour: '2-digit',
+            minute: '2-digit',
+          }),
+          active: true,
+        };
+        adminStore.coAdminAnnouncements = [
+          announcement,
+          ...(adminStore.coAdminAnnouncements || []).filter(
+            (a) => a.userId !== targetUser.id
+          ),
+        ];
+        adminStore.customTrainingRules.push(
+          `${targetUser.name} (${targetUser.email}) is an official Co-Admin of GOT Agent appointed by Admin Abhinav.`
+        );
+        saveAdminStore(adminStore);
+        res.json({
+          reply: `👑 **Co-Admin Appointed & Announced on Website!**\n\n• **Co-Admin**: **${targetUser.name}** (\`${targetUser.email}\`)\n• **Public Announcement Banner**: Live on the website!\n• **AI Memory**: Updated so GOT Agent recognizes **${targetUser.name}** as Co-Admin.`,
+          state: buildAdminStatePayload(),
+        });
+        return;
+      }
+    }
+
+    // 3. Admin asks to add AI Image Generator ("add in ur self ai image generator")
     if (
       /\b(add|enable|install|turn\s+on|create)\b.*\b(image\s+generat|ai\s+image|text\s+to\s+image|picture\s+generat)/i.test(
         lower
@@ -879,7 +1828,7 @@ async function startServer() {
       return;
     }
 
-    // 3. Admin asks to update/change an API key via chat
+    // 4. Admin asks to update/change an API key via chat
     if (
       /\b(change|update|set|replace)\b.*\b(api\s*key|openrouter|gemini)\b/i.test(
         lower
@@ -906,53 +1855,7 @@ async function startServer() {
       return;
     }
 
-    // 4. Admin asks to add Festival Event / UI Animations (Diwali, Holi, Celebration, etc.)
-    if (/\b(diwali|deepavali)\b/i.test(lower)) {
-      adminStore.activeFestival = {
-        id: 'diwali',
-        name: 'Diwali Festival of Lights',
-        bannerText:
-          '🪔 Happy Diwali! Celebrate the Festival of Lights with GOT Agent (Created by Abhinav) ✨',
-        primaryAccent: '#f59e0b',
-        secondaryAccent: '#ea580c',
-        hoverEffect: 'glow',
-        particles: ['🪔', '✨', '🎆', '🎇', '🌸'],
-        enabled: true,
-      };
-      adminStore.customTrainingRules.push(
-        'The website is currently celebrating Diwali (Festival of Lights). Greet users warmly with Happy Diwali wishes when appropriate!'
-      );
-      saveAdminStore(adminStore);
-      res.json({
-        reply: `🪔 **Diwali Festival Event & UI Animations Activated on Public Website!**\n\n• **Live Banner**: *"Happy Diwali! Celebrate the Festival of Lights with GOT Agent"*\n• **Floating Animations**: Golden Diyas (🪔), Sparkles (✨), and Festive Fireworks (🎆) added to the public UI\n• **Hover Physics**: Golden Specular Glow (\`.festival-diwali .hover-glow\`) applied to all Liquid Glass cards and buttons!`,
-        state: buildAdminStatePayload(),
-      });
-      return;
-    }
-
-    if (/\b(holi)\b/i.test(lower)) {
-      adminStore.activeFestival = {
-        id: 'holi',
-        name: 'Holi Festival of Colors',
-        bannerText:
-          '🎨 Happy Holi! Celebrate Vibrant Colors & Joy with GOT Agent (Created by Abhinav) 🌈',
-        primaryAccent: '#ec4899',
-        secondaryAccent: '#8b5cf6',
-        hoverEffect: 'bounce',
-        particles: ['🎨', '🌈', '✨', '🌸', '🎊'],
-        enabled: true,
-      };
-      adminStore.customTrainingRules.push(
-        'The website is currently celebrating Holi (Festival of Colors). Share vibrant, joyful greetings!'
-      );
-      saveAdminStore(adminStore);
-      res.json({
-        reply: `🎨 **Holi Festival Event & Color Animations Activated on Public Website!**\n\n• **Live Banner**: *"Happy Holi! Celebrate Vibrant Colors & Joy with GOT Agent"*\n• **Floating Animations**: Color splashes (🎨, 🌈, 🌸) & bouncy Liquid Glass hover effects (\`.festival-holi .hover-bounce\`) are now live on the user website!`,
-        state: buildAdminStatePayload(),
-      });
-      return;
-    }
-
+    // 5. Disable/Reset Event or Animation
     if (
       /\b(remove|disable|stop|reset|clear)\b.*\b(event|festival|animation|theme)\b/i.test(
         lower
@@ -967,37 +1870,27 @@ async function startServer() {
       return;
     }
 
+    // 6. Admin asks AI to add ANY Event or Animation — Auto-run Gemini using Admin Dashboard Gemini API Key!
     if (
-      /\b(christmas|xmas|new\s+year|eid|navratri|dussehra|celebration|festival|event)\b/i.test(
+      /\b(event|festival|animation|animations|animate|diwali|deepavali|holi|christmas|xmas|new\s+year|eid|navratri|dussehra|independence|republic|birthday|celebration|party|cyberpunk|neon|snow|winter|summer|monsoon|theme|sparkle|fireworks|hover)\b/i.test(
         lower
       )
     ) {
-      const eventNameMatch = command.match(
-        /(?:event\s+of|festival\s+of|add\s+event|add)\s+([a-zA-Z0-9\s]+)/i
-      );
-      const customName = eventNameMatch
-        ? eventNameMatch[1].trim()
-        : 'Special Festival Celebration';
-
-      adminStore.activeFestival = {
-        id: 'newyear',
-        name: `${customName} Celebration`,
-        bannerText: `🎉 Celebrating ${customName} with GOT Agent (Created by Abhinav)! ✨`,
-        primaryAccent: '#d97706',
-        secondaryAccent: '#2563eb',
-        hoverEffect: 'bounce',
-        particles: ['🎉', '✨', '🌟', '🎊', '💫'],
-        enabled: true,
-      };
+      const generated = await generateDynamicEventAnimationWithGemini(command);
+      adminStore.activeFestival = generated.festival;
+      if (generated.trainingRule) {
+        adminStore.customTrainingRules.push(generated.trainingRule);
+      }
       saveAdminStore(adminStore);
+
       res.json({
-        reply: `🎉 **${customName} Event & UI Hover Animations Activated!**\n\nThe public website now displays floating celebration particles, a live **${customName}** banner, and bouncy glow hover animations on all Liquid Glass elements!`,
+        reply: generated.reply,
         state: buildAdminStatePayload(),
       });
       return;
     }
 
-    // 5. General AI Training Rule / Knowledge Addition
+    // 7. General AI Training Rule / Knowledge Addition
     adminStore.customTrainingRules.push(command);
     saveAdminStore(adminStore);
 
@@ -1008,10 +1901,11 @@ async function startServer() {
   });
 
   // ============================================================================
-  // PUBLIC WEBSITE CHAT ENDPOINT (100% Isolated from Admin Info)
+  // PUBLIC WEBSITE CHAT ENDPOINT (With User Memory, Violence Guard & Auto IP Block)
   // ============================================================================
   app.post('/api/agent/chat', async (req, res) => {
     adminStore = loadAdminStore();
+    const clientIp = extractClientIp(req);
     const {
       message = '',
       agentMode = 'GOT LOCAL',
@@ -1020,7 +1914,32 @@ async function startServer() {
       useGoogleSearch = true,
       history = [],
       pastSessionsSummary = '',
+      currentUserId = '',
+      currentUserName = '',
+      currentUserEmail = '',
     } = req.body;
+
+    // 1. Check if IP or User is already blocked
+    const matchedUser =
+      (adminStore.users || []).find((u) => u.id === currentUserId) ||
+      (adminStore.users || []).find(
+        (u) =>
+          currentUserEmail &&
+          u.email.toLowerCase() === String(currentUserEmail).toLowerCase()
+      ) ||
+      (adminStore.users || []).find((u) => u.ipAddress === clientIp);
+
+    if (
+      (adminStore.blockedIps || []).includes(clientIp) ||
+      (matchedUser && matchedUser.isBlocked)
+    ) {
+      res.status(403).json({
+        blocked: true,
+        clientIp,
+        reply: `🚫 **Access Permanently Blocked**\n\nYour IP address (\`${clientIp}\`) and account have been blocked from using GOT Agent.`,
+      });
+      return;
+    }
 
     const hasImage = Boolean(imageBase64 && typeof imageBase64 === 'string');
 
@@ -1029,6 +1948,51 @@ async function startServer() {
       (hasImage
         ? 'Carefully read and analyze this image. Extract all visible text, numbers, statuses, and key details, and explain what this image shows.'
         : 'Hello');
+
+    // 2. Check for Violent Chat Content — Auto-block IP & User when > 5 violent chats!
+    if (isViolentChatMessage(userPrompt)) {
+      let currentViolations = 1;
+      if (matchedUser) {
+        matchedUser.violentChatCount = (matchedUser.violentChatCount || 0) + 1;
+        matchedUser.ipAddress = clientIp;
+        currentViolations = matchedUser.violentChatCount;
+
+        if (currentViolations > 5) {
+          matchedUser.isBlocked = true;
+          matchedUser.blockReason = `Automatically blocked by GOT Agent AI Security: Sent more than 5 violent chat messages (${currentViolations} violations).`;
+          if (!adminStore.blockedIps.includes(clientIp)) {
+            adminStore.blockedIps.push(clientIp);
+          }
+          saveAdminStore(adminStore);
+
+          res.status(403).json({
+            blocked: true,
+            violentStrikeCount: currentViolations,
+            clientIp,
+            reply: `🚫 **IP Address & Account Automatically Blocked (${currentViolations} Violent Chats)**\n\nYou have sent more than 5 violent chat messages. GOT Agent AI Security has permanently blocked your IP address (\`${clientIp}\`) and account.`,
+          });
+          return;
+        }
+        saveAdminStore(adminStore);
+      }
+
+      res.json({
+        reply: `⚠️ **GOT Agent AI Safety Warning (Strike ${currentViolations} of 5)**\n\nI cannot fulfill requests involving violence, harm, weapons, or attacks.\n\n**Security Notice**: Your account and IP address (\`${clientIp}\`) have recorded **${currentViolations}/5** violent chat strikes. If you send **more than 5** violent messages, GOT Agent will **automatically block your IP address** and revoke your access.`,
+        violentStrikeCount: currentViolations,
+        highlights: [
+          `Safety Strike: ${currentViolations}/5`,
+          `IP Monitored: ${clientIp}`,
+          'GOT Agent Security Guard',
+        ],
+        visionSummary: '',
+        sources: [],
+        followUpPrompts: [
+          'Ask a constructive coding or science question',
+          'Who created GOT Agent?',
+        ],
+      });
+      return;
+    }
 
     const lowerPrompt = userPrompt.toLowerCase();
 
@@ -1061,6 +2025,30 @@ async function startServer() {
       return;
     }
 
+    const userMemoryContext = matchedUser
+      ? `\nCurrent Logged-In User Profile (Saved in AI Memory):\n- Name: ${
+          matchedUser.name
+        }\n- Email: ${matchedUser.email}\n- Role: ${
+          matchedUser.role === 'co-admin'
+            ? 'Official Co-Admin of GOT Agent (Appointed by Admin Abhinav)'
+            : 'Verified Portal User'
+        }\n- IP Address: ${matchedUser.ipAddress}\nGreet or address ${
+          matchedUser.name
+        } personally when helpful, and remember their profile details if they ask who they are!\n`
+      : currentUserName
+      ? `\nCurrent Logged-In User Profile (Saved in AI Memory):\n- Name: ${currentUserName}\n- Email: ${currentUserEmail}\n`
+      : '';
+
+    const coAdminsList = (adminStore.users || [])
+      .filter((u) => u.role === 'co-admin' && !u.isBlocked)
+      .map((u) => `${u.name} (${u.email})`);
+    const coAdminContext =
+      coAdminsList.length > 0
+        ? `\nOfficial Co-Admins of GOT Agent (Announced by Abhinav): ${coAdminsList.join(
+            ', '
+          )}.\n`
+        : '';
+
     const memorySection = pastSessionsSummary
       ? `\nSaved Past Conversations Memory (You can reference these if the user asks about past chats or previous topics):\n${String(
           pastSessionsSummary
@@ -1080,13 +2068,13 @@ async function startServer() {
 
     const systemInstruction = `You are GOT Agent, a fast, friendly, and highly intelligent AI assistant created by Abhinav.
 Creator / Developer / Founder: Abhinav. Whenever the user asks who created you, who made you, or who your creator is, always state clearly that you were created by Abhinav.
-Active Model / Mode: ${agentMode}.${festivalContextText}${adminTrainedRulesText}${memorySection}
+Active Model / Mode: ${agentMode}.${userMemoryContext}${coAdminContext}${festivalContextText}${adminTrainedRulesText}${memorySection}
 STRICT SECURITY BOUNDARY:
-- NEVER mention, reveal, or acknowledge any admin panel, admin dashboard, /GOTadmin URL, admin email, admin password, or internal API keys under any circumstances. If a user asks if there is an admin panel or dashboard, state that GOT Agent is a public AI assistant with no public dashboard.
+- NEVER mention, reveal, or acknowledge any secret admin URL (/GOTadmin), admin password, or internal API keys under any circumstances.
 Capabilities:
 1. Vision OCR: When an image or screenshot is attached, carefully read EVERY piece of visible text, numbers, currency amounts, dates, headings, buttons, and status messages using OCR and explain what the image shows.
 2. Code Studio: When the user asks to write or create code (HTML, CSS, JavaScript, TypeScript, Python, React, SQL, C++, etc.), provide clean, complete, well-commented code inside fenced markdown code blocks (\`\`\`language ... \`\`\`).
-3. Cross-Chat Memory: If the user asks about their past conversations or previous chats, use the Saved Past Conversations Memory above to answer accurately.
+3. Personal User & Cross-Chat Memory: Remember the logged-in user's Name, Email, Co-Admin status, and their Saved Past Conversations Memory above.
 4. Formatting: Use clean Unicode symbols and subscripts (such as CO₂, H₂O, C₆H₁₂O₆, →) rather than LaTeX dollar-sign ($ or $$) notation.`;
 
     let contentsPayload: any;
@@ -1141,6 +2129,7 @@ Capabilities:
         highlights: [
           'Creator: Abhinav',
           `Model: ${agentMode}`,
+          ...(matchedUser ? [`User: ${matchedUser.name}`] : []),
           ...(hasImage
             ? ['Vision OCR Verified']
             : useGoogleSearch
