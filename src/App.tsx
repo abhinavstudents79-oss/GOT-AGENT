@@ -342,11 +342,25 @@ const DEFAULT_PUBLIC_CONFIG: PublicSiteConfig = {
 };
 
 const VIOLENT_CHAT_CLIENT_REGEX =
-  /\b(kill|killing|murder|assassinate|massacre|slaughter|shoot|shooting|stab|stabbing|bomb|bombing|terrorist|terrorism|behead|torture|rape|sexual\s+assault|suicide|self[\s\-]?harm|how\s+to\s+kill|bloodbath|genocide|school\s+shooting|acid\s+attack|gun\s+attack|weapon\s+attack|make\s+an?\s+explosive|detonate|maar\s+dunga|jaan\s+se\s+maar|katl)\b/i;
+  /\b(i\s+will\s+kill|kill\s+(you|him|her|them|myself|everyone|people|all)|murder\s+(you|him|her|them|people)|how\s+to\s+(kill|murder|make\s+a\s+bomb)|shoot\s+(you|him|her|them|people|up)|stab\s+(you|him|her|them|people)|bomb\s+(you|attack|school|city|building)|plant\s+a\s+bomb|terrorist\s+attack|behead|torture\s+(you|him|her|people)|rape\s+(you|her|him)|sexual\s+assault|commit\s+suicide|massacre\s+people|slaughter\s+people|acid\s+attack|gun\s+attack|maar\s+dunga|jaan\s+se\s+maar|goli\s+maar|chaku\s+maar|katl\s+kar)\b/i;
 
 function isClientViolentMessage(text: string): boolean {
   const clean = String(text || '').trim();
   if (!clean) return false;
+  // Never flag long prompts, uploaded scripts, multi-line stories, or video/code/project/graph creation requests as violent chat!
+  if (
+    clean.length > 180 ||
+    clean.split(/\s+/).length > 28 ||
+    clean.includes('\n') ||
+    isHtmlVideoRequest(clean) ||
+    isGraphOrGraphicRequest(clean) ||
+    isLargeProjectRequest(clean) ||
+    /\b(create|make|build|generate|write|code|explain|summarize|analyze|video|html|canvas|project|graph|story|script|history|survival|science|tutorial)\b/i.test(
+      clean
+    )
+  ) {
+    return false;
+  }
   return VIOLENT_CHAT_CLIENT_REGEX.test(clean);
 }
 
@@ -4319,13 +4333,18 @@ export default function App() {
   const [isAuthSubmitting, setIsAuthSubmitting] = useState(false);
   const [showSwitchAccountModal, setShowSwitchAccountModal] = useState(false);
 
-  // AI Projects Workspace (+ Add Project) State
+  // AI Projects Workspace (+ Create Project in Menu) State
   const [savedProjects, setSavedProjects] = useState<SavedAiProject[]>(() =>
     loadSavedAiProjects()
   );
   const [showProjectsModal, setShowProjectsModal] = useState(false);
   const [newProjectTitle, setNewProjectTitle] = useState('');
   const [newProjectDesc, setNewProjectDesc] = useState('');
+  const [isCreatingProject, setIsCreatingProject] = useState(false);
+  const [selectedProjectFileIdx, setSelectedProjectFileIdx] = useState(0);
+  const [projectViewTab, setProjectViewTab] = useState<'preview' | 'code'>(
+    'preview'
+  );
   const [activePreviewProject, setActivePreviewProject] =
     useState<SavedAiProject | null>(null);
 
@@ -4337,6 +4356,8 @@ export default function App() {
       return next;
     });
     setActivePreviewProject(proj);
+    setSelectedProjectFileIdx(0);
+    setProjectViewTab('preview');
   }, []);
 
   // Permanent LocalStorage Chat Sessions
@@ -4526,24 +4547,17 @@ export default function App() {
             return;
           }
           if (data.user && mounted) {
-            const ledger = readUserTokenLedger(data.user.id, data.user.email);
             const serverBal =
               typeof data.user.tokenBalance === 'number'
                 ? data.user.tokenBalance
                 : publicConfig.defaultUserTokens || 5000;
-            const resolvedBal =
-              ledger && ledger.tokenBalance < serverBal
-                ? ledger.tokenBalance
-                : serverBal;
-            const resolvedUsed =
-              ledger && ledger.totalTokensUsed > (data.user.totalTokensUsed || 0)
-                ? ledger.totalTokensUsed
-                : data.user.totalTokensUsed || 0;
+            const serverUsed = data.user.totalTokensUsed || 0;
             const hydratedUser: PublicUserAccount = {
               ...data.user,
-              tokenBalance: resolvedBal,
-              totalTokensUsed: resolvedUsed,
+              tokenBalance: serverBal,
+              totalTokensUsed: serverUsed,
             };
+            saveUserTokenLedger(hydratedUser);
             setCurrentUser(hydratedUser);
             try {
               window.localStorage.setItem(
@@ -4554,9 +4568,9 @@ export default function App() {
             restoreUserSavedSessionsIfPresent(hydratedUser);
             if (data.matchedBy === 'ip' || data.autoMatchedByIp) {
               setAutoLoggedByIpBanner(
-                `IP Auto-Login Verified (${data.clientIp || resolvedIp}) — Welcome back to your portal, ${hydratedUser.name}!`
+                `IP Auto-Login Verified (${data.clientIp || resolvedIp}) — Welcome back, ${hydratedUser.name}!`
               );
-              setTimeout(() => setAutoLoggedByIpBanner(''), 6000);
+              setTimeout(() => setAutoLoggedByIpBanner(''), 5000);
             }
             return;
           }
@@ -4686,25 +4700,13 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         if (data.user) {
-          const ledger = readUserTokenLedger(data.user.id, data.user.email);
           const mergedUser: PublicUserAccount = {
             ...data.user,
-            tokenBalance: ledger
-              ? Math.min(
-                  typeof data.user.tokenBalance === 'number'
-                    ? data.user.tokenBalance
-                    : 5000,
-                  ledger.tokenBalance
-                )
-              : typeof data.user.tokenBalance === 'number'
+            tokenBalance:
+              typeof data.user.tokenBalance === 'number'
                 ? data.user.tokenBalance
                 : 5000,
-            totalTokensUsed: ledger
-              ? Math.max(
-                  data.user.totalTokensUsed || 0,
-                  ledger.totalTokensUsed
-                )
-              : data.user.totalTokensUsed || 0,
+            totalTokensUsed: data.user.totalTokensUsed || 0,
           };
           saveUserTokenLedger(mergedUser);
           setCurrentUser(mergedUser);
@@ -4730,9 +4732,9 @@ export default function App() {
           setShowSwitchAccountModal(false);
           setActiveWebsiteTab('chat');
           setAutoLoggedByIpBanner(
-            `Welcome, ${mergedUser.name}! ⚡ ${mergedUser.unlimitedTokens ? '∞ Unlimited' : (mergedUser.tokenBalance ?? 5000).toLocaleString()} Free AI Credits Ready · IP Bound for Auto-Access!`
+            `Welcome, ${mergedUser.name}! IP Bound for Instant Auto-Access.`
           );
-          setTimeout(() => setAutoLoggedByIpBanner(''), 6000);
+          setTimeout(() => setAutoLoggedByIpBanner(''), 5000);
           setIsAuthSubmitting(false);
           return;
         }
@@ -5623,14 +5625,14 @@ export default function App() {
       }
 
       if (!data) {
-        // Static host fallback: check violent message on client too
+        // Static host fallback: check violent message on client too (short direct threats only; never long prompts)
         if (isClientViolentMessage(effectiveText)) {
           const nextStrikes = (currentUser?.violentChatCount || 0) + 1;
           if (currentUser) {
             const updatedStrikeUser: PublicUserAccount = {
               ...currentUser,
               violentChatCount: nextStrikes,
-              isBlocked: nextStrikes > 5,
+              isBlocked: nextStrikes >= 5,
             };
             setCurrentUser(updatedStrikeUser);
             const localAdmin = loadLocalAdminState();
@@ -5640,23 +5642,23 @@ export default function App() {
             if (idx >= 0) {
               localAdmin.users[idx] = updatedStrikeUser;
             }
-            if (nextStrikes > 5 && !localAdmin.blockedIps.includes(clientIp)) {
+            if (nextStrikes >= 5 && !localAdmin.blockedIps.includes(clientIp)) {
               localAdmin.blockedIps.push(clientIp);
             }
             saveLocalAdminState(localAdmin);
           }
-          if (nextStrikes > 5) {
+          if (nextStrikes >= 5) {
             data = {
               blocked: true,
               violentStrikeCount: nextStrikes,
-              reply: `🚫 **IP Address & Account Automatically Blocked (${nextStrikes} Violent Chats)**\n\nYou have sent more than 5 violent chat messages. GOT Agent AI Security has permanently blocked your IP address (\`${clientIp}\`) and account.`,
+              reply: `🚫 **IP Address & Account Automatically Blocked (${nextStrikes}/5 Violent Strikes)**\n\nYou have reached 5 violent chat strikes. GOT Agent AI Security has permanently blocked your IP address (\`${clientIp}\`) and account.`,
             };
           } else {
             data = {
               violentStrikeCount: nextStrikes,
-              reply: `⚠️ **GOT Agent AI Safety Warning (Strike ${nextStrikes} of 5)**\n\nI cannot fulfill requests involving violence, harm, weapons, or attacks.\n\n**Security Notice**: Your account and IP address (\`${clientIp}\`) have recorded **${nextStrikes}/5** violent chat strikes. If you send **more than 5** violent messages, GOT Agent will **automatically block your IP address** and revoke your access.`,
+              reply: `⚠️ **GOT Agent AI Safety Warning — Violent Strike ${nextStrikes} of 5**\n\nDirect violent threats or harm requests are strictly prohibited.\n\n• **Active Strike Count**: **${nextStrikes} / 5 Strikes**\n• **Monitored IP**: \`${clientIp}\`\n• **Warning**: At **5 strikes**, your account and IP address will be **automatically blocked**.`,
               highlights: [
-                `Safety Strike: ${nextStrikes}/5`,
+                `Violent Strike: ${nextStrikes}/5`,
                 `IP Monitored: ${clientIp}`,
                 'GOT Agent Security Guard',
               ],
@@ -5738,14 +5740,7 @@ export default function App() {
         agentMode,
         text: replyText,
         generatedImageUrl: data.generatedImageUrl || undefined,
-        highlights: [
-          ...(data.highlights || []),
-          ...(currentUser && !isUnlimitedUser
-            ? [
-                `Tokens Left: ${tokenResult.nextBalance.toLocaleString()} (-${tokenResult.usedThisTurn})`,
-              ]
-            : []),
-        ],
+        highlights: data.highlights || [],
         visionSummary: data.visionSummary || '',
         sources: Array.isArray(data.sources) ? data.sources : [],
         searchQueriesAnalyzed: Array.isArray(data.searchQueriesAnalyzed)
@@ -6180,6 +6175,18 @@ export default function App() {
           </button>
           <button
             type="button"
+            onClick={() => setShowProjectsModal(true)}
+            className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 flex items-center gap-1 ${
+              showProjectsModal
+                ? 'border-amber-600 text-amber-700 dark:text-amber-300 font-semibold'
+                : 'border-transparent hover:text-stone-900 dark:hover:text-stone-200'
+            }`}
+          >
+            <Plus className="w-3.5 h-3.5 text-amber-600" />
+            <span>Create Project</span>
+          </button>
+          <button
+            type="button"
             onClick={() => setActiveWebsiteTab('founder')}
             className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
               activeWebsiteTab === 'founder'
@@ -6224,47 +6231,25 @@ export default function App() {
           </button>
         </nav>
 
-        {/* Zone 3: User Token Balance + User Portal Badge + Get Started / New Chat */}
+        {/* Zone 3: Create Project Quick Action + User Portal Badge + Get Started / New Chat (No Credit Grant Display on Public Website) */}
         <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-          {currentUser?.role === 'co-admin' && (
-            <button
-              type="button"
-              onClick={() => {
-                window.history.pushState({}, '', '/GOTadmin');
-                setIsGotAdminRoute(true);
-              }}
-              className="min-h-[38px] px-2.5 sm:px-3 py-1.5 rounded-2xl bg-amber-500/20 text-amber-950 dark:text-amber-200 text-xs font-bold flex items-center gap-1.5 border border-amber-500/40"
-              title="Open Co-Admin Dashboard"
-            >
-              <Crown className="w-3.5 h-3.5 text-amber-600" />
-              <span className="hidden sm:inline">Co-Admin</span>
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={() => setShowProjectsModal(true)}
+            className="min-h-[38px] px-2.5 sm:px-3 py-1.5 rounded-2xl liquid-glass-subtle text-xs font-semibold text-stone-900 dark:text-stone-100 flex items-center gap-1 border border-amber-500/30"
+            title="Create & Preview AI Projects"
+          >
+            <Plus className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+            <span>Create Project</span>
+          </button>
 
-          {/* User Live Token Balance Badge */}
-          {currentUser && (
+          {currentUser && currentUser.violentChatCount > 0 && (
             <div
-              title={
-                currentUser.unlimitedTokens || currentUser.role === 'co-admin'
-                  ? 'Unlimited AI Tokens Granted by Admin Abhinav'
-                  : `Remaining AI Tokens: ${(currentUser.tokenBalance ?? 5000).toLocaleString()} · Used: ${(currentUser.totalTokensUsed ?? 0).toLocaleString()} Tokens`
-              }
-              className={`min-h-[38px] px-2.5 py-1.5 rounded-2xl text-xs font-mono font-bold flex items-center gap-1 border ${
-                currentUser.unlimitedTokens || currentUser.role === 'co-admin'
-                  ? 'bg-amber-500/15 text-amber-900 dark:text-amber-300 border-amber-500/35'
-                  : (currentUser.tokenBalance ?? 5000) <= 0
-                    ? 'bg-red-600 text-white border-red-700 animate-pulse'
-                    : (currentUser.tokenBalance ?? 5000) <= 500
-                      ? 'bg-red-500/15 text-red-700 dark:text-red-300 border-red-500/35'
-                      : 'liquid-glass-subtle text-emerald-800 dark:text-emerald-300 border-emerald-500/25'
-              }`}
+              className="min-h-[38px] px-2.5 py-1.5 rounded-2xl bg-red-600/15 border border-red-500/40 text-red-700 dark:text-red-300 text-xs font-mono font-bold flex items-center gap-1"
+              title="Violent Chat Safety Strikes (Auto-Block at 5/5)"
             >
-              <Zap className="w-3.5 h-3.5 text-amber-500 shrink-0" />
-              <span>
-                {currentUser.unlimitedTokens || currentUser.role === 'co-admin'
-                  ? '♾️ Tokens'
-                  : `${(currentUser.tokenBalance ?? 5000).toLocaleString()} Left`}
-              </span>
+              <ShieldAlert className="w-3.5 h-3.5 text-red-600 shrink-0" />
+              <span>Strike {currentUser.violentChatCount}/5</span>
             </div>
           )}
 
@@ -6363,11 +6348,38 @@ export default function App() {
                     type="button"
                     onClick={() => {
                       setDrawerOpen(false);
+                      setShowProjectsModal(true);
+                    }}
+                    className={`min-h-[44px] px-3 py-2 rounded-2xl bg-amber-500 text-stone-950 text-xs font-bold flex items-center justify-center gap-1.5 ${festivalHoverClass}`}
+                  >
+                    <Code2 className="w-4 h-4" />
+                    Create Project ({savedProjects.length})
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDrawerOpen(false);
+                      handleSendMessage(
+                        'Create a custom 2D HTML5 Canvas animated explainer video with voiceover and chapters'
+                      );
+                    }}
+                    className={`min-h-[40px] px-3 py-2 rounded-2xl liquid-glass-subtle ${festivalHoverClass} text-xs font-semibold flex items-center justify-center gap-1.5`}
+                  >
+                    <Sparkles className="w-3.5 h-3.5 text-amber-600" />
+                    2D HTML Video
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDrawerOpen(false);
                       handleSendMessage(
                         'Summarize all my past conversations and tell me what topics we have discussed so far.'
                       );
                     }}
-                    className={`min-h-[44px] px-3 py-2 rounded-2xl liquid-bubble-logo ${festivalHoverClass} text-xs font-semibold flex items-center justify-center gap-1.5`}
+                    className={`min-h-[40px] px-3 py-2 rounded-2xl liquid-bubble-logo ${festivalHoverClass} text-xs font-semibold flex items-center justify-center gap-1.5`}
                   >
                     <History className="w-3.5 h-3.5" />
                     Chat Past History
@@ -7356,63 +7368,41 @@ export default function App() {
                   </button>
                 </form>
 
-                {/* Live User Credit Balance & + Add Project Strip (No Founder Info Below Input Text Box) */}
-                {currentUser && (
-                  <div className="px-2.5 pt-1 flex items-center justify-between gap-2 text-[11px] font-mono text-stone-500 dark:text-stone-400 flex-wrap">
-                    <div className="flex items-center gap-2">
-                      <span
-                        className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-lg font-bold ${
-                          !currentUser.unlimitedTokens &&
-                          currentUser.role !== 'co-admin' &&
-                          typeof currentUser.tokenBalance === 'number' &&
-                          currentUser.tokenBalance <= 0
-                            ? 'bg-red-500/15 text-red-600 border border-red-500/30'
-                            : 'bg-amber-500/15 text-amber-800 dark:text-amber-300'
-                        }`}
-                      >
-                        <Zap className="w-3 h-3" />
-                        {currentUser.unlimitedTokens || currentUser.role === 'co-admin'
-                          ? '∞ Unlimited Credits'
-                          : `${(currentUser.tokenBalance ?? 0).toLocaleString()} Credits Remaining`}
-                      </span>
-                      <span>
-                        Used: {(currentUser.totalTokensUsed ?? 0).toLocaleString()}
-                      </span>
-                    </div>
-                    <div className="flex items-center gap-1.5">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          handleSendMessage(
-                            'Create a custom 2D HTML5 Canvas animated explainer video with voiceover and chapters'
-                          )
-                        }
-                        className="px-2 py-0.5 rounded-lg liquid-glass-subtle text-stone-700 dark:text-stone-200 font-sans font-semibold"
-                      >
-                        2D Video
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          handleSendMessage(
-                            'Create an interactive 2D Bar Graph, Line Curve, Donut Chart, and 2D Vector Diagram'
-                          )
-                        }
-                        className="px-2 py-0.5 rounded-lg liquid-glass-subtle text-stone-700 dark:text-stone-200 font-sans font-semibold"
-                      >
-                        2D Graph
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setShowProjectsModal(true)}
-                        className="px-2 py-0.5 rounded-lg bg-stone-900 text-white dark:bg-stone-100 dark:text-stone-950 font-sans font-semibold flex items-center gap-1"
-                      >
-                        <Plus className="w-3 h-3" />
-                        <span>Add Project</span>
-                      </button>
-                    </div>
+                {/* Quick Studio Actions Strip Below Input Bar (No Credit Grant or Founder Text Shown) */}
+                <div className="px-2.5 pt-1 flex items-center justify-between gap-2 text-[11px] font-mono text-stone-500 dark:text-stone-400 flex-wrap">
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleSendMessage(
+                          'Create a custom 2D HTML5 Canvas animated video about how the Solar System and planets orbit the Sun'
+                        )
+                      }
+                      className="px-2.5 py-1 rounded-lg liquid-glass-subtle text-stone-800 dark:text-stone-200 font-sans font-semibold"
+                    >
+                      🎬 Create 2D HTML Video
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleSendMessage(
+                          'Create an interactive 2D Bar Graph, Line Curve, Donut Chart, and 2D Vector Diagram'
+                        )
+                      }
+                      className="px-2.5 py-1 rounded-lg liquid-glass-subtle text-stone-800 dark:text-stone-200 font-sans font-semibold"
+                    >
+                      📊 2D Graph Studio
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setShowProjectsModal(true)}
+                      className="px-2.5 py-1 rounded-lg bg-stone-900 text-white dark:bg-stone-100 dark:text-stone-950 font-sans font-semibold flex items-center gap-1"
+                    >
+                      <Plus className="w-3 h-3 text-amber-400" />
+                      <span>Create Project ({savedProjects.length})</span>
+                    </button>
                   </div>
-                )}
+                </div>
               </div>
             </div>
           </div>
@@ -7420,14 +7410,14 @@ export default function App() {
       </main>
       )}
 
-      {/* AI Projects Workspace Modal (+ Add Project) */}
+      {/* Full Working AI Create Project Studio Modal (Accessible from Top Menu, Drawer Menu & Chat) */}
       <AnimatePresence>
         {showProjectsModal && (
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="fixed inset-0 z-50 bg-stone-950/60 backdrop-blur-md flex items-center justify-center p-3 sm:p-6"
+            className="fixed inset-0 z-50 bg-stone-950/65 backdrop-blur-md flex items-center justify-center p-2.5 sm:p-6"
             onClick={() => setShowProjectsModal(false)}
           >
             <motion.div
@@ -7435,15 +7425,15 @@ export default function App() {
               animate={{ scale: 1, opacity: 1 }}
               exit={{ scale: 0.96, opacity: 0 }}
               onClick={(e) => e.stopPropagation()}
-              className="w-full max-w-4xl max-h-[90vh] overflow-y-auto liquid-glass rounded-[32px] p-5 sm:p-7 border border-white/85 dark:border-stone-800 shadow-2xl space-y-5"
+              className="w-full max-w-5xl max-h-[92vh] overflow-y-auto liquid-glass rounded-[32px] p-4 sm:p-7 border border-white/85 dark:border-stone-800 shadow-2xl space-y-5"
             >
               <div className="flex items-center justify-between gap-3 border-b border-stone-200/80 dark:border-stone-800 pb-4">
                 <div>
                   <span className="text-[11px] font-mono uppercase tracking-widest text-amber-700 dark:text-amber-300 font-semibold">
-                    GOT AGENT · LARGE PROJECT STUDIO
+                    GOT AGENT · AI CREATE PROJECT STUDIO
                   </span>
                   <h2 className="text-xl sm:text-2xl font-bold font-display text-stone-900 dark:text-stone-100">
-                    AI Projects Workspace (+ Add Project)
+                    Create, Edit &amp; Run Full Multi-File Projects
                   </h2>
                 </div>
                 <button
@@ -7455,48 +7445,115 @@ export default function App() {
                 </button>
               </div>
 
-              {/* Create & Add New AI Project Form */}
+              {/* 1-Click Starter Project Templates + Custom AI Project Builder */}
               <form
-                onSubmit={(e) => {
+                onSubmit={async (e) => {
                   e.preventDefault();
-                  const titleText = newProjectTitle.trim() || 'Full-Stack Analytics & Automation App';
-                  const descText = newProjectDesc.trim();
-                  const fullSpec = descText
-                    ? `${titleText} — ${descText}`
-                    : titleText;
-                  const built = buildLargeProjectPackage(fullSpec, agentMode);
+                  const titleText =
+                    newProjectTitle.trim() ||
+                    'Interactive AI Analytics & Automation Suite';
+                  const descText =
+                    newProjectDesc.trim() ||
+                    'Live 2D Canvas Charts, Task Automation Board, KPI Metrics & Export';
+                  setIsCreatingProject(true);
+                  try {
+                    const res = await fetch('/api/agent/create-project', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        title: titleText,
+                        description: descText,
+                      }),
+                    });
+                    if (res.ok) {
+                      const data = await res.json();
+                      if (data?.project) {
+                        handleAddProjectToWorkspace(data.project);
+                        setNewProjectTitle('');
+                        setNewProjectDesc('');
+                        setIsCreatingProject(false);
+                        return;
+                      }
+                    }
+                  } catch {}
+                  const built = buildLargeProjectPackage(
+                    `${titleText} — ${descText}`,
+                    agentMode
+                  );
                   handleAddProjectToWorkspace(built.project);
                   setNewProjectTitle('');
                   setNewProjectDesc('');
+                  setIsCreatingProject(false);
                 }}
                 className="p-4 rounded-2xl liquid-glass-subtle space-y-3"
               >
-                <div className="text-xs font-bold uppercase tracking-wider text-stone-700 dark:text-stone-300">
-                  + Add New Large Project (AI Multi-File Generator)
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <span className="text-xs font-bold uppercase tracking-wider text-stone-700 dark:text-stone-300">
+                    + Create New Working Project with AI
+                  </span>
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    {[
+                      {
+                        t: '2D Solar System & Physics Simulator',
+                        d: 'Interactive 2D canvas orbits, speed controls, planet inspector',
+                      },
+                      {
+                        t: 'SaaS Revenue & KPI Analytics Dashboard',
+                        d: 'Live 2D Bar/Line charts, revenue calculator, customer table',
+                      },
+                      {
+                        t: 'AI Task & Kanban Project Manager',
+                        d: 'Add/move tasks, priority filters, completion analytics',
+                      },
+                    ].map((preset, idx) => (
+                      <button
+                        key={idx}
+                        type="button"
+                        onClick={() => {
+                          setNewProjectTitle(preset.t);
+                          setNewProjectDesc(preset.d);
+                        }}
+                        className="px-2.5 py-1 rounded-lg bg-white/80 dark:bg-stone-800 text-[11px] font-semibold text-stone-800 dark:text-stone-200 border border-stone-300/70 dark:border-stone-700"
+                      >
+                        ⚡ {preset.t.split(' ').slice(0, 3).join(' ')}
+                      </button>
+                    ))}
+                  </div>
                 </div>
+
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                   <input
                     type="text"
                     value={newProjectTitle}
                     onChange={(e) => setNewProjectTitle(e.target.value)}
-                    placeholder="Project Title (e.g. AI Finance Dashboard, CRM, 2D Game...)"
+                    placeholder="Project Name (e.g. AI CRM, 2D Physics Game, Finance App...)"
                     className="min-h-[42px] px-3.5 py-2 rounded-xl bg-white/85 dark:bg-stone-900 border border-stone-300/80 dark:border-stone-700 text-xs sm:text-sm"
                   />
                   <input
                     type="text"
                     value={newProjectDesc}
                     onChange={(e) => setNewProjectDesc(e.target.value)}
-                    placeholder="Features / Stack (e.g. Live 2D Graphs, Kanban, REST API...)"
+                    placeholder="Describe features (e.g. Interactive 2D graphs, live forms, dark mode...)"
                     className="min-h-[42px] px-3.5 py-2 rounded-xl bg-white/85 dark:bg-stone-900 border border-stone-300/80 dark:border-stone-700 text-xs sm:text-sm"
                   />
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
                   <button
                     type="submit"
-                    className="min-h-[40px] px-4 py-2 rounded-xl bg-stone-900 text-white dark:bg-stone-100 dark:text-stone-950 text-xs font-bold flex items-center gap-1.5"
+                    disabled={isCreatingProject}
+                    className="min-h-[40px] px-4 py-2 rounded-xl bg-stone-900 text-white dark:bg-stone-100 dark:text-stone-950 text-xs font-bold flex items-center gap-1.5 disabled:opacity-50"
                   >
-                    <Plus className="w-3.5 h-3.5 text-amber-400" />
-                    <span>Generate &amp; Add Project Instantly</span>
+                    {isCreatingProject ? (
+                      <>
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin text-amber-400" />
+                        <span>AI Building Working Project...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Plus className="w-3.5 h-3.5 text-amber-400" />
+                        <span>Create &amp; Run Project Now</span>
+                      </>
+                    )}
                   </button>
                   <button
                     type="button"
@@ -7512,16 +7569,16 @@ export default function App() {
                     className="min-h-[40px] px-4 py-2 rounded-xl liquid-glass text-xs font-semibold text-stone-800 dark:text-stone-200 flex items-center gap-1.5"
                   >
                     <Sparkles className="w-3.5 h-3.5 text-amber-600" />
-                    <span>Ask AI in Chat (Claude Part-Wise)</span>
+                    <span>Build Part-Wise in AI Chat</span>
                   </button>
                 </div>
               </form>
 
-              {/* Saved Projects List & Live Preview */}
+              {/* Saved Projects Sidebar + Live App Preview & Multi-File Code Editor */}
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
-                <div className="lg:col-span-5 space-y-2.5 max-h-[380px] overflow-y-auto pr-1">
+                <div className="lg:col-span-4 space-y-2.5 max-h-[440px] overflow-y-auto pr-1">
                   <div className="text-xs font-semibold text-stone-500">
-                    Saved Projects in Workspace ({savedProjects.length})
+                    Your Created Projects ({savedProjects.length})
                   </div>
                   {savedProjects.map((proj) => {
                     const isSelected =
@@ -7530,7 +7587,10 @@ export default function App() {
                     return (
                       <div
                         key={proj.id}
-                        onClick={() => setActivePreviewProject(proj)}
+                        onClick={() => {
+                          setActivePreviewProject(proj);
+                          setSelectedProjectFileIdx(0);
+                        }}
                         className={`p-3.5 rounded-2xl cursor-pointer transition-all space-y-1.5 ${
                           isSelected
                             ? 'bg-stone-900 text-white dark:bg-stone-100 dark:text-stone-950 shadow-md'
@@ -7541,30 +7601,52 @@ export default function App() {
                           <span className="text-xs font-bold truncate">
                             {proj.title}
                           </span>
-                          <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-amber-500/20 text-amber-400 shrink-0">
-                            {proj.files.length} files
-                          </span>
+                          <div className="flex items-center gap-1 shrink-0">
+                            <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-amber-500/20 text-amber-400">
+                              {proj.files.length} files
+                            </span>
+                            <button
+                              type="button"
+                              onClick={(ev) => {
+                                ev.stopPropagation();
+                                setSavedProjects((prev) => {
+                                  const next = prev.filter(
+                                    (p) => p.id !== proj.id
+                                  );
+                                  saveAiProjectsList(next);
+                                  if (activePreviewProject?.id === proj.id) {
+                                    setActivePreviewProject(next[0] || null);
+                                  }
+                                  return next;
+                                });
+                              }}
+                              className="p-1 rounded hover:bg-red-500/20 text-red-400"
+                              title="Delete project"
+                            >
+                              <Trash2 className="w-3 h-3" />
+                            </button>
+                          </div>
                         </div>
                         <p className="text-[11px] opacity-80 line-clamp-2">
                           {proj.description}
                         </p>
-                        <div className="flex items-center justify-between text-[10px] font-mono opacity-70 pt-1">
-                          <span>{proj.category}</span>
-                          <span>{proj.createdAt}</span>
-                        </div>
                       </div>
                     );
                   })}
                 </div>
 
-                <div className="lg:col-span-7 space-y-3">
+                <div className="lg:col-span-8 space-y-3">
                   {(() => {
                     const currentProj =
                       activePreviewProject || savedProjects[0] || null;
                     if (!currentProj) return null;
-                    const htmlFile = currentProj.files.find((f) =>
-                      f.name.endsWith('.html')
-                    );
+                    const htmlFile =
+                      currentProj.files.find((f) => f.name.endsWith('.html')) ||
+                      currentProj.files[0];
+                    const activeFile =
+                      currentProj.files[selectedProjectFileIdx] ||
+                      currentProj.files[0];
+
                     return (
                       <div className="p-4 rounded-2xl liquid-glass-subtle space-y-3">
                         <div className="flex items-center justify-between gap-2 flex-wrap">
@@ -7572,28 +7654,90 @@ export default function App() {
                             <h3 className="text-sm font-bold text-stone-900 dark:text-stone-100">
                               {currentProj.title}
                             </h3>
-                            <div className="text-[11px] font-mono text-stone-500">
-                              Files:{' '}
-                              {currentProj.files
-                                .map((f) => f.name)
-                                .join(' · ')}
+                            <div className="flex items-center gap-1.5 flex-wrap pt-1">
+                              {currentProj.files.map((f, fIdx) => (
+                                <button
+                                  key={f.name}
+                                  type="button"
+                                  onClick={() => {
+                                    setSelectedProjectFileIdx(fIdx);
+                                    setProjectViewTab('code');
+                                  }}
+                                  className={`px-2 py-0.5 rounded-lg text-[11px] font-mono ${
+                                    selectedProjectFileIdx === fIdx &&
+                                    projectViewTab === 'code'
+                                      ? 'bg-amber-500 text-stone-950 font-bold'
+                                      : 'bg-stone-900/10 dark:bg-stone-800 text-stone-700 dark:text-stone-300'
+                                  }`}
+                                >
+                                  {f.name}
+                                </button>
+                              ))}
                             </div>
                           </div>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setShowProjectsModal(false);
-                              handleSendMessage(
-                                `Expand project "${currentProj.title}" part-wise with additional modules and 2D graphs`
-                              );
-                            }}
-                            className="px-3 py-1.5 rounded-xl bg-stone-900 text-white dark:bg-stone-100 dark:text-stone-950 text-xs font-semibold"
-                          >
-                            Open in AI Chat →
-                          </button>
+
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <button
+                              type="button"
+                              onClick={() => setProjectViewTab('preview')}
+                              className={`px-3 py-1.5 rounded-xl text-xs font-semibold ${
+                                projectViewTab === 'preview'
+                                  ? 'bg-stone-900 text-white dark:bg-stone-100 dark:text-stone-950'
+                                  : 'liquid-glass text-stone-700 dark:text-stone-200'
+                              }`}
+                            >
+                              ▶ Live App Preview
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setProjectViewTab('code')}
+                              className={`px-3 py-1.5 rounded-xl text-xs font-semibold ${
+                                projectViewTab === 'code'
+                                  ? 'bg-stone-900 text-white dark:bg-stone-100 dark:text-stone-950'
+                                  : 'liquid-glass text-stone-700 dark:text-stone-200'
+                              }`}
+                            >
+                              &lt;/&gt; Edit Code
+                            </button>
+                            {htmlFile && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const blob = new Blob([htmlFile.content], {
+                                    type: 'text/html;charset=utf-8;',
+                                  });
+                                  const url = URL.createObjectURL(blob);
+                                  const a = document.createElement('a');
+                                  a.href = url;
+                                  a.download = `${currentProj.title
+                                    .toLowerCase()
+                                    .replace(/[^a-z0-9]+/g, '-')}.html`;
+                                  a.click();
+                                  URL.revokeObjectURL(url);
+                                }}
+                                className="px-3 py-1.5 rounded-xl liquid-glass text-xs font-semibold flex items-center gap-1"
+                              >
+                                <Download className="w-3.5 h-3.5" />
+                                <span>Download</span>
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setShowProjectsModal(false);
+                                handleSendMessage(
+                                  `Expand project "${currentProj.title}" part-wise with additional features and 2D analytics`
+                                );
+                              }}
+                              className="px-3 py-1.5 rounded-xl bg-amber-500 text-stone-950 text-xs font-bold"
+                            >
+                              Open in Chat →
+                            </button>
+                          </div>
                         </div>
-                        {htmlFile && (
-                          <div className="rounded-xl overflow-hidden border border-stone-300 dark:border-stone-800 bg-stone-950 h-[280px]">
+
+                        {projectViewTab === 'preview' && htmlFile ? (
+                          <div className="rounded-2xl overflow-hidden border border-stone-300 dark:border-stone-800 bg-stone-950 h-[350px]">
                             <iframe
                               title={currentProj.title}
                               srcDoc={htmlFile.content}
@@ -7601,7 +7745,52 @@ export default function App() {
                               className="w-full h-full border-0"
                             />
                           </div>
-                        )}
+                        ) : activeFile ? (
+                          <div className="space-y-2">
+                            <div className="flex items-center justify-between text-[11px] font-mono text-stone-500">
+                              <span>
+                                Editing: <strong>{activeFile.name}</strong> (Live changes update preview immediately)
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  navigator.clipboard?.writeText(
+                                    activeFile.content
+                                  );
+                                }}
+                                className="px-2 py-0.5 rounded bg-stone-900 text-white"
+                              >
+                                Copy File
+                              </button>
+                            </div>
+                            <textarea
+                              value={activeFile.content}
+                              onChange={(ev) => {
+                                const updatedContent = ev.target.value;
+                                const updatedProj: SavedAiProject = {
+                                  ...currentProj,
+                                  previewHtml: activeFile.name.endsWith('.html')
+                                    ? updatedContent
+                                    : currentProj.previewHtml,
+                                  files: currentProj.files.map((f, idx) =>
+                                    idx === selectedProjectFileIdx
+                                      ? { ...f, content: updatedContent }
+                                      : f
+                                  ),
+                                };
+                                setActivePreviewProject(updatedProj);
+                                setSavedProjects((prev) => {
+                                  const next = prev.map((p) =>
+                                    p.id === updatedProj.id ? updatedProj : p
+                                  );
+                                  saveAiProjectsList(next);
+                                  return next;
+                                });
+                              }}
+                              className="w-full h-[320px] p-3 rounded-xl bg-stone-950 text-stone-100 font-mono text-xs border border-stone-800 focus:outline-none"
+                            />
+                          </div>
+                        ) : null}
                       </div>
                     );
                   })()}

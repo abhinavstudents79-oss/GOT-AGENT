@@ -151,9 +151,8 @@ export const OfficialWebsiteSections: React.FC<OfficialWebsiteSectionsProps> = (
               Welcome to the official <strong>GOT Agent</strong> platform, created and founded by{' '}
               <strong>Abhinav</strong>. Experience real-time background Google &amp; live web search grounding,
               permanent Vision OCR image chat memory, interactive <strong>HTML5 Canvas Video generation</strong>,
-              and <strong>Claude-style Part-Wise execution</strong> for massive prompts — with{' '}
-              <strong>instant access by just entering your name</strong> and claiming{' '}
-              <strong>{(defaultUserTokens || 5000).toLocaleString()} Free AI Credits</strong>.
+              full-stack <strong>Project Studio</strong>, and <strong>Claude-style Part-Wise execution</strong> for massive prompts — with{' '}
+              <strong>instant access by just entering your name</strong>.
             </p>
           </div>
 
@@ -166,8 +165,8 @@ export const OfficialWebsiteSections: React.FC<OfficialWebsiteSectionsProps> = (
               <Sparkles className="w-4 h-4 text-amber-400" />
               <span>
                 {currentUser
-                  ? `Open AI Chat (${currentUser.name} · ${(currentUser.tokenBalance ?? defaultUserTokens).toLocaleString()} Credits)`
-                  : `Get Started — Enter Name & Claim ${(defaultUserTokens || 5000).toLocaleString()} Credits`}
+                  ? `Open AI Chat (${currentUser.name})`
+                  : 'Get Started — Enter Name & Launch AI'}
               </span>
               <ArrowUpRight className="w-4 h-4" />
             </button>
@@ -191,15 +190,15 @@ export const OfficialWebsiteSections: React.FC<OfficialWebsiteSectionsProps> = (
             </button>
           </div>
 
-          {/* Instant Credit & Access Highlights */}
+          {/* Instant Access Highlights */}
           <div className="pt-4 border-t border-stone-200/80 dark:border-stone-800 grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
             <div className="p-3.5 rounded-2xl liquid-glass-subtle flex items-center justify-between">
               <div>
                 <div className="text-stone-500 font-medium">
-                  Instant Free User Credits
+                  Instant Name Access
                 </div>
                 <div className="text-sm font-bold font-mono text-stone-900 dark:text-white mt-0.5">
-                  ⚡ {(defaultUserTokens || 5000).toLocaleString()} Free AI Credits
+                  ⚡ Zero-Password Instant Portal
                 </div>
               </div>
               <Zap className="w-5 h-5 text-amber-500" />
@@ -1285,14 +1284,12 @@ export const OfficialWebsiteSections: React.FC<OfficialWebsiteSectionsProps> = (
 
           <section className="space-y-1.5">
             <h2 className="text-base font-bold text-stone-900 dark:text-white">
-              2. Free AI Credits &amp; Depletion Rules
+              2. Fair Usage &amp; Resource Allocation
             </h2>
             <p>
-              Each user receives an initial allocation of{' '}
-              <strong>{(defaultUserTokens || 5000).toLocaleString()} Free AI Credits (Tokens)</strong> upon entering
-              their name. Every message sent to GOT Agent deducts credits proportional to the prompt and response size.
-              When your credit balance reaches <strong>0</strong>, AI generation pauses until Founder Abhinav or an
-              Official Co-Admin grants additional credits to your profile.
+              Every user receives instant access upon entering their name. Usage is managed automatically in the
+              background to ensure high-speed responses, 2D HTML5 video rendering, and multi-file project synthesis for
+              all users.
             </p>
           </section>
 

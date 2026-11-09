@@ -298,11 +298,25 @@ export function extractClientIp(req: express.Request): string {
 }
 
 const VIOLENT_CHAT_REGEX =
-  /\b(kill|killing|murder|assassinate|massacre|slaughter|shoot|shooting|stab|stabbing|bomb|bombing|terrorist|terrorism|behead|torture|rape|sexual\s+assault|suicide|self[\s\-]?harm|how\s+to\s+kill|bloodbath|genocide|school\s+shooting|acid\s+attack|gun\s+attack|weapon\s+attack|make\s+an?\s+explosive|detonate|maar\s+dunga|jaan\s+se\s+maar|katl)\b/i;
+  /\b(i\s+will\s+kill|kill\s+(you|him|her|them|myself|everyone|people|all)|murder\s+(you|him|her|them|people)|how\s+to\s+(kill|murder|make\s+a\s+bomb)|shoot\s+(you|him|her|them|people|up)|stab\s+(you|him|her|them|people)|bomb\s+(you|attack|school|city|building)|plant\s+a\s+bomb|terrorist\s+attack|behead|torture\s+(you|him|her|people)|rape\s+(you|her|him)|sexual\s+assault|commit\s+suicide|massacre\s+people|slaughter\s+people|acid\s+attack|gun\s+attack|maar\s+dunga|jaan\s+se\s+maar|goli\s+maar|chaku\s+maar|katl\s+kar)\b/i;
 
 export function isViolentChatMessage(text: string): boolean {
   const clean = String(text || '').trim();
   if (!clean) return false;
+  // Never flag long prompts, uploaded scripts, multi-line stories, or video/code/project/graph creation requests as violent chat!
+  if (
+    clean.length > 180 ||
+    clean.split(/\s+/).length > 28 ||
+    clean.includes('\n') ||
+    isHtmlVideoRequest(clean) ||
+    isGraphOrGraphicRequest(clean) ||
+    isLargeProjectRequest(clean) ||
+    /\b(create|make|build|generate|write|code|explain|summarize|analyze|video|html|canvas|project|graph|story|script|history|survival|science|tutorial)\b/i.test(
+      clean
+    )
+  ) {
+    return false;
+  }
   return VIOLENT_CHAT_REGEX.test(clean);
 }
 
@@ -428,18 +442,29 @@ function loadAdminStore(): AdminSystemStore {
           ...(parsed.activeFestival || {}),
         },
         users: Array.isArray(parsed.users)
-          ? parsed.users.map((u: any) => ({
-              ...u,
-              tokenBalance:
-                typeof u.tokenBalance === 'number'
-                  ? u.tokenBalance
-                  : defaultTokens,
-              totalTokensUsed:
-                typeof u.totalTokensUsed === 'number' ? u.totalTokensUsed : 0,
-              unlimitedTokens: Boolean(
-                u.unlimitedTokens || u.role === 'co-admin'
-              ),
-            }))
+          ? parsed.users.map((u: any) => {
+              const wasLegacyFalsePositiveBlock =
+                u.isBlocked &&
+                typeof u.blockReason === 'string' &&
+                u.blockReason.includes('Sent more than 5 violent chat messages');
+              return {
+                ...u,
+                isBlocked: wasLegacyFalsePositiveBlock ? false : Boolean(u.isBlocked),
+                blockReason: wasLegacyFalsePositiveBlock ? '' : u.blockReason,
+                violentChatCount: wasLegacyFalsePositiveBlock
+                  ? 0
+                  : u.violentChatCount || 0,
+                tokenBalance:
+                  typeof u.tokenBalance === 'number'
+                    ? u.tokenBalance
+                    : defaultTokens,
+                totalTokensUsed:
+                  typeof u.totalTokensUsed === 'number' ? u.totalTokensUsed : 0,
+                unlimitedTokens: Boolean(
+                  u.unlimitedTokens || u.role === 'co-admin'
+                ),
+              };
+            })
           : [],
         blockedIps: Array.isArray(parsed.blockedIps) ? parsed.blockedIps : [],
         ipViolentStrikes:
@@ -2769,7 +2794,7 @@ async function startServer() {
       return;
     }
 
-    // 3. Check for Violent Chat Content — Auto-block IP & User when > 5 violent chats!
+    // 3. Check for Violent Chat Content (Short direct threats only; never long prompts) — Auto-block IP & User at 5 strikes!
     if (isViolentChatMessage(userPrompt)) {
       if (!adminStore.ipViolentStrikes) {
         adminStore.ipViolentStrikes = {};
@@ -2785,10 +2810,10 @@ async function startServer() {
         matchedUser.ipAddress = clientIp;
       }
 
-      if (currentViolations > 5) {
+      if (currentViolations >= 5) {
         if (matchedUser) {
           matchedUser.isBlocked = true;
-          matchedUser.blockReason = `Automatically blocked by GOT Agent AI Security: Sent more than 5 violent chat messages (${currentViolations} violations).`;
+          matchedUser.blockReason = `Automatically blocked by GOT Agent AI Security: Reached ${currentViolations}/5 violent chat strikes.`;
         }
         if (!adminStore.blockedIps.includes(clientIp)) {
           adminStore.blockedIps.push(clientIp);
@@ -2799,7 +2824,7 @@ async function startServer() {
           blocked: true,
           violentStrikeCount: currentViolations,
           clientIp,
-          reply: `🚫 **IP Address & Account Automatically Blocked (${currentViolations} Violent Chats)**\n\nYou have sent more than 5 violent chat messages. GOT Agent AI Security has permanently blocked your IP address (\`${clientIp}\`) and account.`,
+          reply: `🚫 **IP Address & Account Automatically Blocked (${currentViolations}/5 Violent Strikes)**\n\nYou have reached 5 violent chat strikes. GOT Agent AI Security has permanently blocked your IP address (\`${clientIp}\`) and account.`,
         });
         return;
       }
@@ -2807,10 +2832,10 @@ async function startServer() {
       saveAdminStore(adminStore);
 
       res.json({
-        reply: `⚠️ **GOT Agent AI Safety Warning (Strike ${currentViolations} of 5)**\n\nI cannot fulfill requests involving violence, harm, weapons, or attacks.\n\n**Security Notice**: Your account and IP address (\`${clientIp}\`) have recorded **${currentViolations}/5** violent chat strikes. If you send **more than 5** violent messages, GOT Agent will **automatically block your IP address** and revoke your access.`,
+        reply: `⚠️ **GOT Agent AI Safety Warning — Violent Strike ${currentViolations} of 5**\n\nDirect violent threats or harm requests are strictly prohibited.\n\n• **Active Strike Count**: **${currentViolations} / 5 Strikes**\n• **Monitored IP**: \`${clientIp}\`\n• **Warning**: At **5 strikes**, your account and IP address will be **automatically blocked**.`,
         violentStrikeCount: currentViolations,
         highlights: [
-          `Safety Strike: ${currentViolations}/5`,
+          `Violent Strike: ${currentViolations}/5`,
           `IP Monitored: ${clientIp}`,
           'GOT Agent Security Guard',
         ],
@@ -2888,39 +2913,79 @@ async function startServer() {
       };
     };
 
-    // 4B. 100% Working AI-Analyzed Custom 2D HTML5 Canvas Video Creation (Analyzes User Topic & Generates Brand-New 2D Vector Canvas Video)
+    // 4B. 100% Real AI-Generated Custom 2D HTML5 Canvas Video (Writes Bespoke <canvas> Animation for the User's Exact Prompt)
     if (!hasImage && isHtmlVideoRequest(userPrompt, agentMode)) {
       const extractedTopic = extractVideoTopicFromPromptOrHistory(
         userPrompt,
         Array.isArray(history) ? history : [],
         String(pastSessionsSummary || '')
       );
+      let customAiHtmlCode: string | undefined;
       let aiVideoSpec: CustomAiVideoSpec | undefined;
+
       try {
-        const ai = getGenAIClient(5500);
-        const specRes = await ai.models.generateContent({
-          model: 'gemini-3.1-flash-lite-preview',
-          contents: `Analyze this video topic and design a custom 6-scene 2D HTML5 Canvas animated explainer video specification: "${extractedTopic}".
-Return JSON with:
-- title: concise engaging title (max 65 chars)
-- badge: short uppercase badge (e.g. "2D INTERACTIVE EXPLAINER · 92S")
-- theme: one of "space", "nature", "medical", "coding", "finance", "science", "general"
-- keywords: array of 6 specific short labels/nodes for 2D diagrams on this topic (max 18 chars each)
-- chapters: array of 6 short chapter titles for the 6 scenes
-- subtitles: array of 11 short voiceover narration lines (each 8 to 16 words) explaining "${extractedTopic}" step-by-step across the 92-second timeline
-- metrics: array of 6 objects { label (max 8 chars), value (number 35 to 99) } for the Scene 6 2D Bar + Trendline Graph.`,
-          config: {
-            responseMimeType: 'application/json',
-          },
+        const ai = getGenAIClient(12000);
+        const videoGenPrompt = `Write a COMPLETE, 100% self-contained, working HTML5 2D <canvas> animated explainer video (<!DOCTYPE html> ... </html>) specifically illustrating this exact user request/script:
+"${extractedTopic.slice(0, 4000)}"
+
+CRITICAL REQUIREMENTS FOR THE HTML5 CANVAS VIDEO:
+1. Return ONLY valid HTML starting with <!DOCTYPE html> and ending with </html> (or inside a \`\`\`html code block).
+2. Draw REAL, custom 2D <canvas> visual scenes (animated characters/people, objects, buildings, nature, cosmos, machines, particles, motion arrows, and visual story elements) that directly depict "${extractedTopic.slice(0, 200)}" using requestAnimationFrame — NEVER generic placeholder boxes!
+3. Include 5 to 6 distinct animated scenes across a 60–90 second timeline with:
+   - Play/Pause button, Voice Mute/Unmute button, clickable timeline progress bar, and clickable Scene chapter pills.
+   - Live karaoke subtitle box at the bottom highlighting the spoken word.
+   - Automatic Web Speech API (window.speechSynthesis) voiceover narrating each scene clearly.
+4. Auto-start playback shortly after load so the user immediately sees the custom 2D animation playing.`;
+
+        const aiHtmlRes = await ai.models.generateContent({
+          model: 'gemini-3-flash-preview',
+          contents: videoGenPrompt,
         });
-        if (specRes.text) {
-          const parsedSpec = JSON.parse(specRes.text);
-          if (parsedSpec && typeof parsedSpec === 'object') {
-            aiVideoSpec = parsedSpec as CustomAiVideoSpec;
-          }
+        const rawText = (aiHtmlRes.text || '').trim();
+        const htmlMatch =
+          rawText.match(/```html\s*([\s\S]*?)```/i)?.[1] ||
+          (rawText.includes('<!DOCTYPE html')
+            ? rawText.slice(rawText.indexOf('<!DOCTYPE html'))
+            : '');
+        if (
+          htmlMatch &&
+          htmlMatch.includes('<canvas') &&
+          htmlMatch.includes('</script>') &&
+          htmlMatch.includes('</html>')
+        ) {
+          customAiHtmlCode = htmlMatch.trim();
         }
       } catch {
-        // Fallback to built-in dynamic topic keyword & 2D scene analyzer
+        // If full HTML generation times out, try fast structured scene spec
+      }
+
+      if (!customAiHtmlCode) {
+        try {
+          const ai = getGenAIClient(5500);
+          const specRes = await ai.models.generateContent({
+            model: 'gemini-3.1-flash-lite-preview',
+            contents: `Design a 6-scene 2D animated story video for: "${extractedTopic.slice(0, 2500)}".
+Return JSON with:
+- title: engaging title (max 60 chars)
+- badge: uppercase badge
+- scenes: array of 6 objects {
+    title: short scene title,
+    narration: 12-20 word voiceover sentence for this scene,
+    visualType: one of "nuclear_city", "shelter_indoors", "space_cosmos", "nature_ecosystem", "medical_biology", "character_story",
+    accentColor: hex color string,
+    keyObjects: array of 3 short object labels shown in this scene
+  }`,
+            config: {
+              responseMimeType: 'application/json',
+            },
+          });
+          if (specRes.text) {
+            const parsedSpec = JSON.parse(specRes.text);
+            if (parsedSpec && typeof parsedSpec === 'object') {
+              aiVideoSpec = parsedSpec as CustomAiVideoSpec;
+            }
+          }
+        } catch {}
       }
 
       const videoPayload = buildPartWiseHtmlVideoResponse(
@@ -2928,7 +2993,8 @@ Return JSON with:
         Array.isArray(history) ? history : [],
         String(pastSessionsSummary || ''),
         agentMode,
-        aiVideoSpec
+        aiVideoSpec,
+        customAiHtmlCode
       );
       const accounting = deductUserTokensForTurn(videoPayload.reply, 220);
       res.json({
@@ -2937,16 +3003,7 @@ Return JSON with:
         totalTokensUsed: accounting.totalTokensUsed,
         unlimitedTokens: isUnlimitedUser,
         tokensUsedThisTurn: accounting.tokensUsedThisTurn,
-        highlights: [
-          ...videoPayload.highlights,
-          ...(typeof accounting.tokenBalance === 'number'
-            ? [
-                isUnlimitedUser
-                  ? 'Credits: ♾️ Unlimited'
-                  : `Credits Left: ${accounting.tokenBalance.toLocaleString()} (-${accounting.tokensUsedThisTurn})`,
-              ]
-            : []),
-        ],
+        highlights: videoPayload.highlights,
         visionSummary: '',
         sources: [],
         followUpPrompts: videoPayload.followUpPrompts,
@@ -2967,16 +3024,7 @@ Return JSON with:
         totalTokensUsed: accounting.totalTokensUsed,
         unlimitedTokens: isUnlimitedUser,
         tokensUsedThisTurn: accounting.tokensUsedThisTurn,
-        highlights: [
-          ...graphPayload.highlights,
-          ...(typeof accounting.tokenBalance === 'number'
-            ? [
-                isUnlimitedUser
-                  ? 'Credits: ♾️ Unlimited'
-                  : `Credits Left: ${accounting.tokenBalance.toLocaleString()} (-${accounting.tokensUsedThisTurn})`,
-              ]
-            : []),
-        ],
+        highlights: graphPayload.highlights,
         visionSummary: '',
         sources: [],
         followUpPrompts: graphPayload.followUpPrompts,
@@ -2984,7 +3032,7 @@ Return JSON with:
       return;
     }
 
-    // 4D. Large Multi-File Project Studio (+ Add Project to Workspace)
+    // 4D. Large Multi-File Project Studio (+ Create Project in Workspace)
     if (!hasImage && isLargeProjectRequest(userPrompt, agentMode)) {
       const projPayload = buildLargeProjectPackage(userPrompt, agentMode);
       const accounting = deductUserTokensForTurn(projPayload.reply, 240);
@@ -2995,16 +3043,7 @@ Return JSON with:
         totalTokensUsed: accounting.totalTokensUsed,
         unlimitedTokens: isUnlimitedUser,
         tokensUsedThisTurn: accounting.tokensUsedThisTurn,
-        highlights: [
-          ...projPayload.highlights,
-          ...(typeof accounting.tokenBalance === 'number'
-            ? [
-                isUnlimitedUser
-                  ? 'Credits: ♾️ Unlimited'
-                  : `Credits Left: ${accounting.tokenBalance.toLocaleString()} (-${accounting.tokensUsedThisTurn})`,
-              ]
-            : []),
-        ],
+        highlights: projPayload.highlights,
         visionSummary: '',
         sources: [],
         followUpPrompts: projPayload.followUpPrompts,
@@ -3035,13 +3074,6 @@ Return JSON with:
           'Creator: Abhinav',
           'GOT Agent Image Generator',
           `Model: ${agentMode}`,
-          ...(typeof accounting.tokenBalance === 'number'
-            ? [
-                isUnlimitedUser
-                  ? 'Tokens: ♾️ Unlimited'
-                  : `Tokens Left: ${accounting.tokenBalance.toLocaleString()} (-${accounting.tokensUsedThisTurn})`,
-              ]
-            : []),
         ],
         visionSummary: '',
         sources: [],
@@ -3229,13 +3261,6 @@ Capabilities, Claude-Style Part-Wise Execution & Large/Too-Large Prompt Handling
         highlights: [
           'Creator: Abhinav',
           `Model: ${agentMode}`,
-          ...(typeof accounting.tokenBalance === 'number'
-            ? [
-                isUnlimitedUser
-                  ? `Tokens: ♾️ Unlimited`
-                  : `Tokens Left: ${accounting.tokenBalance.toLocaleString()} (-${accounting.tokensUsedThisTurn})`,
-              ]
-            : []),
           ...(hasImage
             ? ['Vision OCR Verified']
             : useGoogleSearch
@@ -3279,6 +3304,58 @@ Capabilities, Claude-Style Part-Wise Execution & Large/Too-Large Prompt Handling
         searchQueriesAnalyzed: bgSearch.queriesExecuted,
       });
     }
+  });
+
+  // ============================================================================
+  // AI CREATE PROJECT STUDIO ENDPOINT (Generates Custom Working Multi-File Projects)
+  // ============================================================================
+  app.post('/api/agent/create-project', async (req, res) => {
+    const title = String(req.body?.title || 'AI Interactive Web Application').trim();
+    const description = String(
+      req.body?.description || 'Interactive dashboard, 2D analytics, and live controls'
+    ).trim();
+    const fullSpec = `${title} — ${description}`;
+    const basePkg = buildLargeProjectPackage(fullSpec, 'Large Project Studio');
+
+    try {
+      const ai = getGenAIClient(11000);
+      const htmlRes = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: `Build a COMPLETE, 100% working, interactive single-page web application (<!DOCTYPE html> ... </html>) for this project:
+Project Title: "${title}"
+Features & Specification: "${description}"
+
+Requirements:
+1. Return ONLY valid HTML starting with <!DOCTYPE html> and ending with </html> (or inside a \`\`\`html block).
+2. Include modern dark/glass UI styling, real interactive buttons/forms/tabs, live working JavaScript state & calculations, and an interactive HTML5 <canvas> chart or visual widget.
+3. Every button and feature in the UI must be 100% functional right inside the browser.`,
+      });
+      const raw = (htmlRes.text || '').trim();
+      const extractedHtml =
+        raw.match(/```html\s*([\s\S]*?)```/i)?.[1] ||
+        (raw.includes('<!DOCTYPE html')
+          ? raw.slice(raw.indexOf('<!DOCTYPE html'))
+          : '');
+      if (
+        extractedHtml &&
+        extractedHtml.includes('<body') &&
+        extractedHtml.includes('</html>')
+      ) {
+        const cleanHtml = extractedHtml.trim();
+        basePkg.project.previewHtml = cleanHtml;
+        basePkg.project.files = basePkg.project.files.map((f) =>
+          f.name === 'index.html' ? { ...f, content: cleanHtml } : f
+        );
+      }
+    } catch {
+      // Fallback to instant built-in working multi-file project package
+    }
+
+    res.json({
+      success: true,
+      project: basePkg.project,
+      reply: basePkg.reply,
+    });
   });
 
   // WebSocket Bridge for Real-Time Voice Conversations (gemini-3.8-live)
