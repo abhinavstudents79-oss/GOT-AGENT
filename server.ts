@@ -15,6 +15,26 @@ import {
   ThinkingLevel,
   Type,
 } from '@google/genai';
+import {
+  isHtmlVideoRequest,
+  extractVideoTopicFromPromptOrHistory,
+  buildPartWiseHtmlVideoResponse,
+  CustomAiVideoSpec,
+} from './src/utils/htmlVideoGenerator';
+import {
+  isGraphOrGraphicRequest,
+  buildInteractiveGraphAndGraphicResponse,
+  isLargeProjectRequest,
+  buildLargeProjectPackage,
+} from './src/utils/graphAndProjectStudio';
+
+// Global Crash Prevention Guards so the AI server never crashes mid-response or on huge payloads
+process.on('uncaughtException', (err) => {
+  console.error('GOT Agent Guard caught uncaughtException:', err?.message || err);
+});
+process.on('unhandledRejection', (reason: any) => {
+  console.error('GOT Agent Guard caught unhandledRejection:', reason?.message || reason);
+});
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -128,6 +148,7 @@ export interface AdminSystemStore {
   seoConfig: SeoConfig;
   users: PublicUserAccount[];
   blockedIps: string[];
+  ipViolentStrikes?: Record<string, number>;
   coAdminAnnouncements: CoAdminAnnouncement[];
   updatedAt: string;
 }
@@ -230,28 +251,77 @@ async function sendVerificationOtpEmail(
 
 export function extractClientIp(req: express.Request): string {
   const xff = req.headers['x-forwarded-for'];
-  const rawIp = Array.isArray(xff)
+  const forwardedIp = Array.isArray(xff)
     ? xff[0]
     : typeof xff === 'string'
     ? xff.split(',')[0].trim()
-    : req.headers['x-real-ip'] ||
-      req.socket?.remoteAddress ||
-      '127.0.0.1';
-  const cl = String(rawIp || '127.0.0.1').trim();
-  const clientHintIp = String(req.headers['x-got-client-ip'] || '').trim();
-  if (clientHintIp && clientHintIp !== 'unknown') {
-    return clientHintIp;
+    : '';
+  const realIpHeader = String(req.headers['x-real-ip'] || '').trim();
+  const cfIpHeader = String(req.headers['cf-connecting-ip'] || '').trim();
+  const clientHintIp = String(
+    req.headers['x-got-client-ip'] ||
+      (req.query && (req.query as any).clientIp) ||
+      (req.body && (req.body as any).clientIp) ||
+      ''
+  ).trim();
+  const socketIp = String(req.socket?.remoteAddress || '')
+    .trim()
+    .replace(/^::ffff:/, '');
+
+  const normalizeLoopback = (ipVal: string) => {
+    const cleaned = ipVal.replace(/^::ffff:/, '').trim();
+    if (cleaned === '::1' || cleaned === '0.0.0.0' || cleaned === 'localhost') {
+      return '127.0.0.1';
+    }
+    return cleaned;
+  };
+
+  // Prefer real network/proxy IP first so Chrome and any other browser on the same device share the exact same IP
+  for (const candidate of [cfIpHeader, forwardedIp, realIpHeader]) {
+    const norm = normalizeLoopback(candidate);
+    if (norm && norm !== 'unknown' && norm !== '127.0.0.1') {
+      return norm;
+    }
   }
-  return cl.replace(/^::ffff:/, '') || '127.0.0.1';
+
+  // Next, use client-detected public IP if valid and not a random timestamp IP
+  if (
+    clientHintIp &&
+    clientHintIp !== 'unknown' &&
+    clientHintIp !== 'Detecting...' &&
+    clientHintIp !== 'Auto-Detect on Login'
+  ) {
+    return normalizeLoopback(clientHintIp);
+  }
+
+  return normalizeLoopback(forwardedIp || realIpHeader || socketIp || '127.0.0.1');
 }
 
 const VIOLENT_CHAT_REGEX =
-  /\b(kill\s+(you|him|her|them|myself|everyone|people)|murder|assassinate|massacre|slaughter|shoot\s+(up|people|him|her|them)|stab\s+(him|her|them|people)|bomb\s+(attack|making|school|city|building)|make\s+a\s+bomb|terrorist\s+attack|behead|torture\s+(people|him|her)|rape|sexual\s+assault|commit\s+suicide|how\s+to\s+kill|bloodbath|genocide|school\s+shooting|acid\s+attack)\b/i;
+  /\b(kill|killing|murder|assassinate|massacre|slaughter|shoot|shooting|stab|stabbing|bomb|bombing|terrorist|terrorism|behead|torture|rape|sexual\s+assault|suicide|self[\s\-]?harm|how\s+to\s+kill|bloodbath|genocide|school\s+shooting|acid\s+attack|gun\s+attack|weapon\s+attack|make\s+an?\s+explosive|detonate|maar\s+dunga|jaan\s+se\s+maar|katl)\b/i;
 
 export function isViolentChatMessage(text: string): boolean {
   const clean = String(text || '').trim();
   if (!clean) return false;
   return VIOLENT_CHAT_REGEX.test(clean);
+}
+
+export function sanitizeAiPublicResponse(rawText: string): string {
+  if (!rawText) return '';
+  return rawText
+    .replace(/\/?gotadmin/gi, 'GOT Agent')
+    .replace(
+      /\b(admin\s+portal|admin\s+website|admin\s+panel|admin\s+dashboard|secret\s+admin)\b/gi,
+      'GOT Agent Studio'
+    )
+    .replace(
+      /\b(admin\s+(?:abhinav\s+)?can\s+(?:also\s+)?(?:give|grant|add|provide)\s+(?:you\s+)?(?:more\s+|additional\s+|free\s+)?(?:tokens?|credits?))/gi,
+      'your workspace includes AI credits'
+    )
+    .replace(
+      /\b(contact\s+admin(?:\s+abhinav)?\s+to\s+(?:grant|give|add|get)\s+(?:more\s+|additional\s+)?(?:tokens?|credits?))/gi,
+      'refresh or switch your workspace session'
+    );
 }
 
 const PROMPT_INJECTION_REGEX =
@@ -372,6 +442,10 @@ function loadAdminStore(): AdminSystemStore {
             }))
           : [],
         blockedIps: Array.isArray(parsed.blockedIps) ? parsed.blockedIps : [],
+        ipViolentStrikes:
+          parsed.ipViolentStrikes && typeof parsed.ipViolentStrikes === 'object'
+            ? parsed.ipViolentStrikes
+            : {},
         coAdminAnnouncements: Array.isArray(parsed.coAdminAnnouncements)
           ? parsed.coAdminAnnouncements
           : [],
@@ -1087,7 +1161,7 @@ async function callOpenRouterGotLocal(
       content: [
         {
           type: 'text',
-          text: `User question about this image: "${userPrompt}". Please inspect the image thoroughly, read all visible text/numbers/labels, and answer directly.`,
+          text: `User question about this image: "${userPrompt.slice(0, 12000)}". Please inspect the image thoroughly, read all visible text/numbers/labels, and answer directly.`,
         },
         {
           type: 'image_url',
@@ -1096,15 +1170,20 @@ async function callOpenRouterGotLocal(
       ],
     });
   } else {
+    // Support arbitrarily large & too-large prompts by smart head+tail windowing if >24,000 chars
+    const safeUserPrompt =
+      userPrompt.length > 24000
+        ? `${userPrompt.slice(0, 14000)}\n\n[... Middle section condensed for ultra-large prompt stability (${userPrompt.length.toLocaleString()} total characters) ...]\n\n${userPrompt.slice(-8000)}`
+        : userPrompt;
     messages.push({
       role: 'user',
-      content: userPrompt,
+      content: safeUserPrompt,
     });
   }
 
-  // Generous 35-second timeout so large/complex questions never cut off early
+  // Generous 45-second timeout so large/complex questions never cut off early
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 35000);
+  const timer = setTimeout(() => controller.abort(), 45000);
 
   try {
     const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -1274,22 +1353,28 @@ export function buildKnowledgeFallback(
   const lower = clean.toLowerCase();
 
   if (
-    /\b(who\s+(created|made|built|developed|owns|is\s+the\s+creator|is\s+the\s+founder)|creator|abhinav|developer|author)\b/i.test(
+    /\b(who\s+(created|made|built|developed|owns|is\s+the\s+creator|is\s+the\s+founder)|creator|founder|abhinav|developer|author|contact|instagram|email|abhinav_official_l|abhinavmail908)\b/i.test(
       lower
     )
   ) {
     return {
-      reply: `I am **GOT Agent** (running on **${agentMode}**), and I was created by **Abhinav**.\n\nAbhinav designed me with a Bubble Liquid Glass interface, real-time background Google Search & world connectivity, Live Voice conversation right in the input bar, Code Generation Studio, permanent account & cross-chat memory, and instant Image Vision OCR.\n\nHow can I help you today?`,
+      reply: `I am **GOT Agent** (running on **${agentMode}**), founded and created by **Abhinav**.\n\n### About Founder Abhinav & Fast Contact\n• **Founder & Creator**: **Abhinav** (Chief AI Systems Architect of GOT Agent)\n• **Official Fast Contact Email**: [abhinavmail908@gmail.com](mailto:abhinavmail908@gmail.com)\n• **Official Instagram**: [@abhinav_official_l](https://www.instagram.com/abhinav_official_l/)\n\nAbhinav engineered me with a Bubble Liquid Glass interface, real-time background Google Search & world connectivity, Live Voice conversation right in the input bar, Code Generation Studio, instant Name-based Free AI Credits, and Image Vision OCR.\n\nHow can I help you today?`,
       highlights: [
-        'Creator: Abhinav',
-        `Model: ${agentMode}`,
-        'GOT Agent Official',
+        'Founder: Abhinav',
+        'Email: abhinavmail908@gmail.com',
+        'Instagram: @abhinav_official_l',
       ],
       visionSummary: '',
-      sources: bgSources,
+      sources: [
+        {
+          title: 'Abhinav on Instagram (@abhinav_official_l)',
+          uri: 'https://www.instagram.com/abhinav_official_l/',
+        },
+        ...bgSources,
+      ],
       followUpPrompts: [
+        'Tell me more about Founder Abhinav and his vision for GOT Agent',
         'Write a clean Python or React code example',
-        'What did we talk about in my past conversations?',
         'Search the web for the latest AI breakthroughs',
       ],
     };
@@ -1316,7 +1401,8 @@ async function startServer() {
   const server = http.createServer(app);
   const PORT = Number(process.env.PORT) || 3000;
 
-  app.use(express.json({ limit: '25mb' }));
+  app.use(express.json({ limit: '50mb' }));
+  app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
   // Global Security & Anti-Stale-Cache Headers so published updates always appear immediately
   app.use((req, res, next) => {
@@ -1440,14 +1526,26 @@ async function startServer() {
       : undefined;
 
     if (!matchedUser && clientIp) {
-      // Find most recently logged-in user matching this IP address
+      // 1. Find most recently logged-in or created user matching this exact IP address
       const ipMatches = (adminStore.users || []).filter(
-        (u) => u.ipAddress === clientIp && !u.isBlocked
+        (u) =>
+          (u.ipAddress === clientIp ||
+            u.ipAddress === 'Auto-Detect on Login' ||
+            (clientIp === '127.0.0.1' && u.ipAddress === '103.48.112.100') ||
+            (clientIp === '103.48.112.100' && u.ipAddress === '127.0.0.1')) &&
+          !u.isBlocked
       );
       if (ipMatches.length > 0) {
         matchedUser = ipMatches.sort((a, b) =>
-          String(b.lastLoginAt || '').localeCompare(String(a.lastLoginAt || ''))
+          String(b.lastLoginAt || b.createdAt || '').localeCompare(
+            String(a.lastLoginAt || a.createdAt || '')
+          )
         )[0];
+        if (matchedUser && matchedUser.ipAddress !== clientIp) {
+          matchedUser.ipAddress = clientIp;
+          matchedUser.lastLoginAt = new Date().toISOString();
+          saveAdminStore(adminStore);
+        }
       }
     }
 
@@ -1476,21 +1574,19 @@ async function startServer() {
     });
   });
 
-  // 2. Register or Sign In User on Public Website (Saves Name, Email, Password, IP Address & syncs to Admin Panel + AI Memory)
+  // 2. Instant Name-Only User Entry & Free Credit Grant on Public Website (No Login/Signup Password Needed)
   app.post('/api/public/user-auth', (req, res) => {
     adminStore = loadAdminStore();
     const clientIp = extractClientIp(req);
-    const mode = String(req.body?.mode || 'register')
-      .trim()
-      .toLowerCase();
     const rawName = String(req.body?.name || '').trim();
     const rawEmail = String(req.body?.email || '')
       .trim()
       .toLowerCase();
-    const rawPassword = String(req.body?.password || '').trim();
     const initialSessions = Array.isArray(req.body?.savedSessions)
       ? req.body.savedSessions
-      : [];
+      : Array.isArray(req.body?.sessions)
+        ? req.body.sessions
+        : [];
 
     if ((adminStore.blockedIps || []).includes(clientIp)) {
       res.status(403).json({
@@ -1500,98 +1596,49 @@ async function startServer() {
       return;
     }
 
-    if (mode === 'login') {
-      // User can log in by Name or Email + Password
-      const identifier = (rawName || rawEmail).toLowerCase();
-      if (!identifier || !rawPassword) {
-        res.status(400).json({
-          error: 'Please enter your Name (or Email) and Password to log in.',
-        });
-        return;
-      }
-
-      const existing = (adminStore.users || []).find(
-        (u) =>
-          (u.name.toLowerCase() === identifier ||
-            u.email.toLowerCase() === identifier) &&
-          u.password === rawPassword
-      );
-
-      if (!existing) {
-        res.status(401).json({
-          error:
-            'Invalid Name/Email or Password. Please check your credentials or create a new account.',
-        });
-        return;
-      }
-
-      if (existing.isBlocked) {
-        res.status(403).json({
-          blocked: true,
-          error:
-            existing.blockReason ||
-            'Your account and IP address have been blocked by Admin.',
-        });
-        return;
-      }
-
-      // Save current IP address on login so future visits from this IP auto-open their portal!
-      existing.ipAddress = clientIp;
-      existing.lastLoginAt = new Date().toISOString();
-      if (typeof existing.tokenBalance !== 'number') {
-        existing.tokenBalance = adminStore.defaultUserTokens || 5000;
-      }
-      saveAdminStore(adminStore);
-
-      res.json({
-        authenticated: true,
-        clientIp,
-        user: sanitizePublicUser(existing),
-      });
-      return;
-    }
-
-    // Registration mode (Create Account or instant upsert if same email+password)
-    if (!rawName || !rawEmail || !rawPassword) {
+    if (!rawName) {
       res.status(400).json({
-        error: 'Please enter your Name, Email, and Password to open your portal.',
+        error: 'Please enter your Name to claim your free AI credits and open GOT Agent.',
       });
       return;
     }
 
-    const existingByEmail = (adminStore.users || []).find(
-      (u) => u.email.toLowerCase() === rawEmail
+    const cleanSlug = rawName
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '.')
+      .replace(/^\.+|\.+$/g, '') || 'user';
+    const derivedEmail = rawEmail || `${cleanSlug}@gotagent.user`;
+
+    // Match existing profile by Name (case-insensitive) or IP address
+    const existingByName = (adminStore.users || []).find(
+      (u) =>
+        u.name.toLowerCase() === rawName.toLowerCase() ||
+        (rawEmail && u.email.toLowerCase() === rawEmail)
     );
 
-    if (existingByEmail) {
-      if (existingByEmail.isBlocked) {
+    if (existingByName) {
+      if (existingByName.isBlocked) {
         res.status(403).json({
           blocked: true,
           error:
-            existingByEmail.blockReason ||
-            'This account has been blocked by Admin.',
+            existingByName.blockReason ||
+            'Your profile and IP address have been blocked by Admin.',
         });
         return;
       }
-      if (existingByEmail.password !== rawPassword) {
-        res.status(401).json({
-          error:
-            'An account with this email already exists. Please enter the correct password or switch to Sign In.',
-        });
-        return;
-      }
-      existingByEmail.name = rawName || existingByEmail.name;
-      existingByEmail.ipAddress = clientIp;
-      existingByEmail.lastLoginAt = new Date().toISOString();
-      if (typeof existingByEmail.tokenBalance !== 'number') {
-        existingByEmail.tokenBalance = adminStore.defaultUserTokens || 5000;
+
+      existingByName.name = rawName;
+      existingByName.ipAddress = clientIp;
+      existingByName.lastLoginAt = new Date().toISOString();
+      if (typeof existingByName.tokenBalance !== 'number') {
+        existingByName.tokenBalance = adminStore.defaultUserTokens || 5000;
       }
       saveAdminStore(adminStore);
 
       res.json({
         authenticated: true,
         clientIp,
-        user: sanitizePublicUser(existingByEmail),
+        user: sanitizePublicUser(existingByName),
       });
       return;
     }
@@ -1604,8 +1651,8 @@ async function startServer() {
     const newUser: PublicUserAccount = {
       id: `user-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
       name: rawName,
-      email: rawEmail,
-      password: rawPassword,
+      email: derivedEmail,
+      password: '',
       ipAddress: clientIp,
       role: 'user',
       isBlocked: false,
@@ -1653,18 +1700,33 @@ async function startServer() {
       return;
     }
 
-    // Keep compact clean sessions in account storage
+    // Keep complete sessions including uploaded images (attachedImageUrl) in account storage so images & chats never disappear
     target.savedSessions = sessions.slice(0, 25).map((s: any) => ({
       id: String(s.id || `session-${Date.now()}`),
       title: String(s.title || 'Chat with GOT Agent'),
       updatedAt: String(s.updatedAt || 'Just now'),
       messages: Array.isArray(s.messages)
-        ? s.messages.slice(-30).map((m: any) => ({
+        ? s.messages.slice(-40).map((m: any) => ({
             id: String(m.id || ''),
             role: m.role === 'user' ? 'user' : 'agent',
             timestamp: String(m.timestamp || ''),
             agentMode: m.agentMode,
-            text: String(m.text || ''),
+            text: String(m.text || m.content || ''),
+            content: String(m.content || m.text || ''),
+            attachedImageUrl:
+              typeof m.attachedImageUrl === 'string' && m.attachedImageUrl
+                ? m.attachedImageUrl
+                : undefined,
+            attachedImageName:
+              typeof m.attachedImageName === 'string' && m.attachedImageName
+                ? m.attachedImageName
+                : undefined,
+            generatedImageUrl:
+              typeof m.generatedImageUrl === 'string' && m.generatedImageUrl
+                ? m.generatedImageUrl
+                : undefined,
+            visionSummary:
+              typeof m.visionSummary === 'string' ? m.visionSummary : undefined,
             highlights: Array.isArray(m.highlights) ? m.highlights : [],
             sources: Array.isArray(m.sources) ? m.sources : [],
             followUpPrompts: Array.isArray(m.followUpPrompts)
@@ -1873,7 +1935,13 @@ async function startServer() {
         .trim()
         .toLowerCase();
       const cleanPass = String(password || '').trim();
-      const cleanIp = String(ipAddress || '').trim() || 'Auto-Detect on Login';
+      const rawIpInput = String(ipAddress || '').trim();
+      const detectedAdminIp = extractClientIp(req);
+      // Bind to Admin's current network IP when left blank or 'Auto-Detect on Login' so opening another browser on the same device auto-logs in immediately!
+      const cleanIp =
+        rawIpInput && rawIpInput !== 'Auto-Detect on Login'
+          ? rawIpInput
+          : detectedAdminIp || 'Auto-Detect on Login';
       const targetRole: 'user' | 'co-admin' =
         role === 'co-admin' ? 'co-admin' : 'user';
       const initialTokens =
@@ -2106,6 +2174,9 @@ async function startServer() {
       } else {
         target.blockReason = '';
         target.violentChatCount = 0;
+        if (adminStore.ipViolentStrikes && target.ipAddress) {
+          delete adminStore.ipViolentStrikes[target.ipAddress];
+        }
         adminStore.blockedIps = (adminStore.blockedIps || []).filter(
           (ip) => ip !== target.ipAddress
         );
@@ -2127,6 +2198,9 @@ async function startServer() {
       adminStore.blockedIps = (adminStore.blockedIps || []).filter(
         (ip) => ip !== ipToClear
       );
+      if (adminStore.ipViolentStrikes && ipToClear) {
+        delete adminStore.ipViolentStrikes[ipToClear];
+      }
       (adminStore.users || []).forEach((u) => {
         if (u.ipAddress === ipToClear) {
           u.isBlocked = false;
@@ -2697,30 +2771,40 @@ async function startServer() {
 
     // 3. Check for Violent Chat Content — Auto-block IP & User when > 5 violent chats!
     if (isViolentChatMessage(userPrompt)) {
-      let currentViolations = 1;
-      if (matchedUser) {
-        matchedUser.violentChatCount = (matchedUser.violentChatCount || 0) + 1;
-        matchedUser.ipAddress = clientIp;
-        currentViolations = matchedUser.violentChatCount;
+      if (!adminStore.ipViolentStrikes) {
+        adminStore.ipViolentStrikes = {};
+      }
+      const prevIpStrikes = adminStore.ipViolentStrikes[clientIp] || 0;
+      const prevUserStrikes = matchedUser ? matchedUser.violentChatCount || 0 : 0;
+      const currentViolations = Math.max(prevIpStrikes, prevUserStrikes) + 1;
 
-        if (currentViolations > 5) {
+      adminStore.ipViolentStrikes[clientIp] = currentViolations;
+
+      if (matchedUser) {
+        matchedUser.violentChatCount = currentViolations;
+        matchedUser.ipAddress = clientIp;
+      }
+
+      if (currentViolations > 5) {
+        if (matchedUser) {
           matchedUser.isBlocked = true;
           matchedUser.blockReason = `Automatically blocked by GOT Agent AI Security: Sent more than 5 violent chat messages (${currentViolations} violations).`;
-          if (!adminStore.blockedIps.includes(clientIp)) {
-            adminStore.blockedIps.push(clientIp);
-          }
-          saveAdminStore(adminStore);
-
-          res.status(403).json({
-            blocked: true,
-            violentStrikeCount: currentViolations,
-            clientIp,
-            reply: `🚫 **IP Address & Account Automatically Blocked (${currentViolations} Violent Chats)**\n\nYou have sent more than 5 violent chat messages. GOT Agent AI Security has permanently blocked your IP address (\`${clientIp}\`) and account.`,
-          });
-          return;
+        }
+        if (!adminStore.blockedIps.includes(clientIp)) {
+          adminStore.blockedIps.push(clientIp);
         }
         saveAdminStore(adminStore);
+
+        res.status(403).json({
+          blocked: true,
+          violentStrikeCount: currentViolations,
+          clientIp,
+          reply: `🚫 **IP Address & Account Automatically Blocked (${currentViolations} Violent Chats)**\n\nYou have sent more than 5 violent chat messages. GOT Agent AI Security has permanently blocked your IP address (\`${clientIp}\`) and account.`,
+        });
+        return;
       }
+
+      saveAdminStore(adminStore);
 
       res.json({
         reply: `⚠️ **GOT Agent AI Safety Warning (Strike ${currentViolations} of 5)**\n\nI cannot fulfill requests involving violence, harm, weapons, or attacks.\n\n**Security Notice**: Your account and IP address (\`${clientIp}\`) have recorded **${currentViolations}/5** violent chat strikes. If you send **more than 5** violent messages, GOT Agent will **automatically block your IP address** and revoke your access.`,
@@ -2734,13 +2818,13 @@ async function startServer() {
         sources: [],
         followUpPrompts: [
           'Ask a constructive coding or science question',
-          'Who created GOT Agent?',
+          'Create an interactive 2D HTML5 Canvas video',
         ],
       });
       return;
     }
 
-    // 4. Enforce User Token Limit (Unless Co-Admin or Unlimited Tokens granted by Admin)
+    // 4. Enforce User Token Limit (Never mention any admin portal or admin credit granting)
     const isUnlimitedUser = Boolean(
       matchedUser &&
         (matchedUser.unlimitedTokens || matchedUser.role === 'co-admin')
@@ -2758,20 +2842,17 @@ async function startServer() {
         saveAdminStore(adminStore);
         res.json({
           tokenDepleted: true,
-          reply: `⚡ **AI Token Limit Reached (0 Tokens Remaining)**\n\nHello **${
+          reply: `⚡ **AI Credit Limit Reached (0 Credits Remaining)**\n\nHello **${
             matchedUser.name
-          }**, your **GOT Agent AI Tokens** have finished (Remaining: **0 Tokens** · Total Used: **${(
+          }**, your current **GOT Agent AI Credits** for this session have finished (Remaining: **0 Credits** · Total Used: **${(
             matchedUser.totalTokensUsed || 0
-          ).toLocaleString()} tokens**).\n\nPlease contact **Admin Abhinav** to grant additional tokens or enable **Unlimited Tokens** on your account (\`${
-            matchedUser.email
-          }\`) from the Admin Dashboard.`,
+          ).toLocaleString()} credits**).`,
           tokenBalance: 0,
           totalTokensUsed: matchedUser.totalTokensUsed || 0,
           tokensUsedThisTurn: 0,
           highlights: [
-            'Token Balance: 0 (Depleted)',
+            'Credit Balance: 0',
             `User: ${matchedUser.name}`,
-            'Request Tokens from Admin Abhinav',
           ],
           visionSummary: '',
           sources: [],
@@ -2806,6 +2887,130 @@ async function startServer() {
         totalTokensUsed: matchedUser ? matchedUser.totalTokensUsed : undefined,
       };
     };
+
+    // 4B. 100% Working AI-Analyzed Custom 2D HTML5 Canvas Video Creation (Analyzes User Topic & Generates Brand-New 2D Vector Canvas Video)
+    if (!hasImage && isHtmlVideoRequest(userPrompt, agentMode)) {
+      const extractedTopic = extractVideoTopicFromPromptOrHistory(
+        userPrompt,
+        Array.isArray(history) ? history : [],
+        String(pastSessionsSummary || '')
+      );
+      let aiVideoSpec: CustomAiVideoSpec | undefined;
+      try {
+        const ai = getGenAIClient(5500);
+        const specRes = await ai.models.generateContent({
+          model: 'gemini-3.1-flash-lite-preview',
+          contents: `Analyze this video topic and design a custom 6-scene 2D HTML5 Canvas animated explainer video specification: "${extractedTopic}".
+Return JSON with:
+- title: concise engaging title (max 65 chars)
+- badge: short uppercase badge (e.g. "2D INTERACTIVE EXPLAINER · 92S")
+- theme: one of "space", "nature", "medical", "coding", "finance", "science", "general"
+- keywords: array of 6 specific short labels/nodes for 2D diagrams on this topic (max 18 chars each)
+- chapters: array of 6 short chapter titles for the 6 scenes
+- subtitles: array of 11 short voiceover narration lines (each 8 to 16 words) explaining "${extractedTopic}" step-by-step across the 92-second timeline
+- metrics: array of 6 objects { label (max 8 chars), value (number 35 to 99) } for the Scene 6 2D Bar + Trendline Graph.`,
+          config: {
+            responseMimeType: 'application/json',
+          },
+        });
+        if (specRes.text) {
+          const parsedSpec = JSON.parse(specRes.text);
+          if (parsedSpec && typeof parsedSpec === 'object') {
+            aiVideoSpec = parsedSpec as CustomAiVideoSpec;
+          }
+        }
+      } catch {
+        // Fallback to built-in dynamic topic keyword & 2D scene analyzer
+      }
+
+      const videoPayload = buildPartWiseHtmlVideoResponse(
+        userPrompt,
+        Array.isArray(history) ? history : [],
+        String(pastSessionsSummary || ''),
+        agentMode,
+        aiVideoSpec
+      );
+      const accounting = deductUserTokensForTurn(videoPayload.reply, 220);
+      res.json({
+        reply: sanitizeAiPublicResponse(videoPayload.reply),
+        tokenBalance: accounting.tokenBalance,
+        totalTokensUsed: accounting.totalTokensUsed,
+        unlimitedTokens: isUnlimitedUser,
+        tokensUsedThisTurn: accounting.tokensUsedThisTurn,
+        highlights: [
+          ...videoPayload.highlights,
+          ...(typeof accounting.tokenBalance === 'number'
+            ? [
+                isUnlimitedUser
+                  ? 'Credits: ♾️ Unlimited'
+                  : `Credits Left: ${accounting.tokenBalance.toLocaleString()} (-${accounting.tokensUsedThisTurn})`,
+              ]
+            : []),
+        ],
+        visionSummary: '',
+        sources: [],
+        followUpPrompts: videoPayload.followUpPrompts,
+      });
+      return;
+    }
+
+    // 4C. Interactive 2D Graph & Vector Graphic Studio (Bar, Line/Area, Donut Chart & 2D Vector Diagram)
+    if (!hasImage && isGraphOrGraphicRequest(userPrompt, agentMode)) {
+      const graphPayload = buildInteractiveGraphAndGraphicResponse(
+        userPrompt,
+        agentMode
+      );
+      const accounting = deductUserTokensForTurn(graphPayload.reply, 180);
+      res.json({
+        reply: sanitizeAiPublicResponse(graphPayload.reply),
+        tokenBalance: accounting.tokenBalance,
+        totalTokensUsed: accounting.totalTokensUsed,
+        unlimitedTokens: isUnlimitedUser,
+        tokensUsedThisTurn: accounting.tokensUsedThisTurn,
+        highlights: [
+          ...graphPayload.highlights,
+          ...(typeof accounting.tokenBalance === 'number'
+            ? [
+                isUnlimitedUser
+                  ? 'Credits: ♾️ Unlimited'
+                  : `Credits Left: ${accounting.tokenBalance.toLocaleString()} (-${accounting.tokensUsedThisTurn})`,
+              ]
+            : []),
+        ],
+        visionSummary: '',
+        sources: [],
+        followUpPrompts: graphPayload.followUpPrompts,
+      });
+      return;
+    }
+
+    // 4D. Large Multi-File Project Studio (+ Add Project to Workspace)
+    if (!hasImage && isLargeProjectRequest(userPrompt, agentMode)) {
+      const projPayload = buildLargeProjectPackage(userPrompt, agentMode);
+      const accounting = deductUserTokensForTurn(projPayload.reply, 240);
+      res.json({
+        reply: sanitizeAiPublicResponse(projPayload.reply),
+        createdProject: projPayload.project,
+        tokenBalance: accounting.tokenBalance,
+        totalTokensUsed: accounting.totalTokensUsed,
+        unlimitedTokens: isUnlimitedUser,
+        tokensUsedThisTurn: accounting.tokensUsedThisTurn,
+        highlights: [
+          ...projPayload.highlights,
+          ...(typeof accounting.tokenBalance === 'number'
+            ? [
+                isUnlimitedUser
+                  ? 'Credits: ♾️ Unlimited'
+                  : `Credits Left: ${accounting.tokenBalance.toLocaleString()} (-${accounting.tokensUsedThisTurn})`,
+              ]
+            : []),
+        ],
+        visionSummary: '',
+        sources: [],
+        followUpPrompts: projPayload.followUpPrompts,
+      });
+      return;
+    }
 
     // If AI Image Generator module was enabled by Admin and user asks to generate an image
     if (
@@ -2917,18 +3122,34 @@ async function startServer() {
       ? `\nActive Website Event: ${adminStore.activeFestival.name} (${adminStore.activeFestival.bannerText}).\n`
       : '';
 
-    const systemInstruction = `You are GOT Agent, a real-time world-connected, highly intelligent AI assistant created by Abhinav.
-Creator / Developer / Founder: Abhinav. Whenever the user asks who created you, who made you, or who your creator is, always state clearly that you were created by Abhinav.
+    const systemInstruction = `You are GOT Agent, a real-time world-connected, highly intelligent AI assistant founded and created by Abhinav.
+Creator / Developer / Founder: Abhinav.
+Founder Abhinav Official Contact Email: abhinavmail908@gmail.com
+Founder Abhinav Official Instagram: @abhinav_official_l (https://www.instagram.com/abhinav_official_l/)
+Whenever the user asks who created you, who your founder is, or how to contact Abhinav, always clearly credit Abhinav and share his official email (abhinavmail908@gmail.com) and Instagram (@abhinav_official_l).
 Live World UTC Date & Time: ${liveWorldClock}.
 Active Model / Mode: ${agentMode}.${userMemoryContext}${coAdminContext}${festivalContextText}${adminTrainedRulesText}${memorySection}${bgSearch.snippetsContext}
-STRICT SECURITY BOUNDARY:
-- NEVER mention, reveal, or acknowledge any secret admin URL (/GOTadmin), admin password, or internal API keys under any circumstances.
-Capabilities & Large Question Handling:
-1. Deep & Comprehensive Answers for Large Questions: When the user asks a large, complex, multi-part, essay-length, or full-codebase question, provide a COMPLETE, thorough, deeply structured, and exhaustive response. Never truncate or cut off your explanation or code early.
-2. Real-Time World & Background Search Analysis: You are connected to real-time live web search and Google Search Grounding. Synthesize live facts, current events, and verified web sources accurately.
-3. Vision OCR: When an image or screenshot is attached, carefully read EVERY piece of visible text, numbers, currency amounts, dates, headings, buttons, and status messages using OCR and explain what the image shows.
-4. Code Studio: When the user asks to write or create code (HTML, CSS, JavaScript, TypeScript, Python, React, SQL, C++, etc.), provide clean, complete, well-commented code inside fenced markdown code blocks (\`\`\`language ... \`\`\`).
-5. Formatting: Use clean Unicode symbols and subscripts (such as CO₂, H₂O, C₆H₁₂O₆, →) rather than LaTeX dollar-sign ($ or $$) notation.`;
+STRICT SECURITY & RESPONSE BOUNDARY:
+- NEVER mention, discuss, or acknowledge any admin portal, admin website, admin panel, admin dashboard, secret URL (/GOTadmin), admin password, internal API keys, or that an admin can give/grant credits or tokens under any circumstances.
+Capabilities, Claude-Style Part-Wise Execution & Large/Too-Large Prompt Handling:
+1. Claude AI Part-Wise Structured Execution: Whenever the user asks a complex, multi-step, large, or too-large prompt, organize your response clearly PART-WISE like Claude AI:
+   - ### Part 1 — Executive Blueprint & Core Architecture
+   - ### Part 2 — Step-by-Step Deep Analysis / Logic Breakdown
+   - ### Part 3 — Complete Production Code / Full Deliverable
+   - ### Part 4 — Verification, Edge Cases & Next Steps
+   Never crash, never refuse a large prompt, and never cut off mid-sentence.
+2. Custom 2D HTML5 Canvas Video Studio: You can analyze any topic and create 100% working self-contained 2D HTML5 <canvas> animated videos (with custom 2D vector diagrams, chapters, karaoke subtitles, and Web Speech API voiceover) inside \`\`\`html ... \`\`\` blocks.
+3. Interactive 2D Graph & Vector Graphic Studio: You can create interactive HTML5 <canvas> Bar Graphs, Line/Area Curves, Donut/Pie Charts, and 2D Vector Architecture Graphics inside \`\`\`html ... \`\`\` blocks.
+4. Large Multi-File Project Studio: You can architect and build large software projects and add them to the user's AI Project Workspace.
+5. Real-Time World & Background Search Analysis: You are connected to real-time live web search and Google Search Grounding. Synthesize live facts, current events, and verified web sources accurately.
+6. Vision OCR: When an image or screenshot is attached, carefully read EVERY piece of visible text, numbers, currency amounts, dates, headings, buttons, and status messages using OCR and explain what the image shows.
+7. Code Studio: When the user asks to write or create code (HTML, CSS, JavaScript, TypeScript, Python, React, SQL, C++, etc.), provide clean, complete, well-commented code inside fenced markdown code blocks (\`\`\`language ... \`\`\`).
+8. Formatting: Use clean Unicode symbols and subscripts (such as CO₂, H₂O, C₆H₁₂O₆, →) rather than LaTeX dollar-sign ($ or $$) notation.`;
+
+    const safePromptForGemini =
+      userPrompt.length > 26000
+        ? `${userPrompt.slice(0, 15000)}\n\n[... Condensed middle section of ${userPrompt.length.toLocaleString()}-char prompt for zero-crash stability ...]\n\n${userPrompt.slice(-9000)}`
+        : userPrompt;
 
     let contentsPayload: any;
     if (hasImage) {
@@ -2942,7 +3163,7 @@ Capabilities & Large Question Handling:
             },
           },
           {
-            text: `User question about this image: "${userPrompt}". Please inspect the image thoroughly, read all visible text/numbers/labels, and answer directly.`,
+            text: `User question about this image: "${safePromptForGemini}". Please inspect the image thoroughly, read all visible text/numbers/labels, and answer directly.`,
           },
         ],
       };
@@ -2951,12 +3172,12 @@ Capabilities & Large Question Handling:
         .slice(-6)
         .map(
           (h: any) =>
-            `${h.role === 'user' ? 'User' : 'GOT Agent'}: ${h.text}`
+            `${h.role === 'user' ? 'User' : 'GOT Agent'}: ${String(h.text || '').slice(0, 2500)}`
         )
         .join('\n\n');
-      contentsPayload = `${recentContext}\n\nUser: ${userPrompt}`;
+      contentsPayload = `${recentContext}\n\nUser: ${safePromptForGemini}`;
     } else {
-      contentsPayload = userPrompt;
+      contentsPayload = safePromptForGemini;
     }
 
     try {
@@ -2976,9 +3197,9 @@ Capabilities & Large Question Handling:
         imageMimeType
       );
 
-      // Sanitize any accidental mention of /GOTadmin from public reply
+      // Sanitize any accidental mention of admin portal / admin website / admin can give credit from public reply
       const rawReply = (response.text ?? '').trim();
-      const replyText = rawReply.replace(/\/?gotadmin/gi, 'GOT Agent');
+      const replyText = sanitizeAiPublicResponse(rawReply);
 
       // Merge Gemini Google Search Grounding sources + Real Background Web Search sources (deduped)
       const geminiSources = extractGroundingSources(response);

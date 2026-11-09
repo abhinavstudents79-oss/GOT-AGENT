@@ -60,13 +60,22 @@ import {
   PublicWebsiteTab,
 } from './components/OfficialWebsiteSections';
 import {
-  auth,
-  onAuthStateChanged,
-  signInWithGoogleFirebase,
-  syncFirebaseAuthenticatedUser,
-  syncChatSessionToFirebase,
-  subscribeGlobalSiteConfigFromFirebase,
-} from './firebase';
+  isHtmlVideoRequest,
+  buildPartWiseHtmlVideoResponse,
+} from './utils/htmlVideoGenerator';
+import {
+  SavedAiProject,
+  loadSavedAiProjects,
+  saveAiProjectsList,
+  isGraphOrGraphicRequest,
+  buildInteractiveGraphAndGraphicResponse,
+  isLargeProjectRequest,
+  buildLargeProjectPackage,
+} from './utils/graphAndProjectStudio';
+import {
+  saveImageToPersistentVault,
+  getAllSavedImagesFromVault,
+} from './utils/imagePersistence';
 
 const OPERATOR_AVATAR_URL = operatorAvatarImg;
 const SAMPLE_NOTES_IMAGE = sampleNotesImg;
@@ -333,7 +342,7 @@ const DEFAULT_PUBLIC_CONFIG: PublicSiteConfig = {
 };
 
 const VIOLENT_CHAT_CLIENT_REGEX =
-  /\b(kill\s+(you|him|her|them|myself|everyone|people)|murder|assassinate|massacre|slaughter|shoot\s+(up|people|him|her|them)|stab\s+(him|her|them|people)|bomb\s+(attack|making|school|city|building)|make\s+a\s+bomb|terrorist\s+attack|behead|torture\s+(people|him|her)|rape|sexual\s+assault|commit\s+suicide|how\s+to\s+kill|bloodbath|genocide|school\s+shooting|acid\s+attack)\b/i;
+  /\b(kill|killing|murder|assassinate|massacre|slaughter|shoot|shooting|stab|stabbing|bomb|bombing|terrorist|terrorism|behead|torture|rape|sexual\s+assault|suicide|self[\s\-]?harm|how\s+to\s+kill|bloodbath|genocide|school\s+shooting|acid\s+attack|gun\s+attack|weapon\s+attack|make\s+an?\s+explosive|detonate|maar\s+dunga|jaan\s+se\s+maar|katl)\b/i;
 
 function isClientViolentMessage(text: string): boolean {
   const clean = String(text || '').trim();
@@ -341,29 +350,41 @@ function isClientViolentMessage(text: string): boolean {
   return VIOLENT_CHAT_CLIENT_REGEX.test(clean);
 }
 
+function sanitizeClientAiReply(rawText: string): string {
+  if (!rawText) return '';
+  return rawText
+    .replace(/\/?gotadmin/gi, 'GOT Agent')
+    .replace(
+      /\b(admin\s+portal|admin\s+website|admin\s+panel|admin\s+dashboard|secret\s+admin)\b/gi,
+      'GOT Agent Studio'
+    )
+    .replace(
+      /\b(admin\s+(?:abhinav\s+)?can\s+(?:also\s+)?(?:give|grant|add|provide)\s+(?:you\s+)?(?:more\s+|additional\s+|free\s+)?(?:tokens?|credits?))/gi,
+      'your workspace includes AI credits'
+    )
+    .replace(
+      /\b(contact\s+admin(?:\s+abhinav)?\s+to\s+(?:grant|give|add|get)\s+(?:more\s+|additional\s+)?(?:tokens?|credits?))/gi,
+      'refresh or switch your workspace session'
+    );
+}
+
 function getOrGenerateClientIp(): string {
   if (typeof window === 'undefined') return '127.0.0.1';
   try {
     const cached = window.localStorage.getItem(DEVICE_IP_CACHE_KEY);
-    if (cached) return cached;
-    // Generate a stable realistic IP for this browser/device until server or ipify returns public IP
-    const seed =
-      (navigator.userAgent?.length || 42) +
-      (window.screen?.width || 390) +
-      (navigator.hardwareConcurrency || 4);
-    const oct2 = (seed * 17) % 220 || 48;
-    const oct3 = (seed * 31) % 250 || 112;
-    const oct4 = Math.floor(10 + ((Date.now() / 1000) % 230));
-    const fallbackIp = `103.${oct2}.${oct3}.${oct4}`;
+    if (cached && cached !== 'unknown' && cached !== 'Detecting...') {
+      return cached;
+    }
+    // Deterministic device-shared fallback IP (no Date.now() randomness!) so Chrome and another browser on the same device match
+    const fallbackIp = '103.48.112.100';
     window.localStorage.setItem(DEVICE_IP_CACHE_KEY, fallbackIp);
     return fallbackIp;
   } catch {
-    return '103.48.112.24';
+    return '103.48.112.100';
   }
 }
 
 async function resolveLiveClientIp(): Promise<string> {
-  const current = getOrGenerateClientIp();
   try {
     const res = await fetch('https://api.ipify.org?format=json');
     if (res.ok) {
@@ -377,7 +398,24 @@ async function resolveLiveClientIp(): Promise<string> {
       }
     }
   } catch {}
-  return current;
+
+  try {
+    const cfgRes = await fetch(`/api/public/site-config?t=${Date.now()}`, {
+      cache: 'no-store',
+    });
+    if (cfgRes.ok) {
+      const cfgData = await cfgRes.json();
+      if (cfgData?.clientIp && cfgData.clientIp !== 'unknown') {
+        const srvIp = String(cfgData.clientIp).trim();
+        try {
+          window.localStorage.setItem(DEVICE_IP_CACHE_KEY, srvIp);
+        } catch {}
+        return srvIp;
+      }
+    }
+  } catch {}
+
+  return getOrGenerateClientIp();
 }
 
 function checkIsGotAdminUrl(): boolean {
@@ -1067,6 +1105,34 @@ async function runStaticHostClientChat(params: {
   const lower = params.message.toLowerCase();
   const hasImage = Boolean(params.imageBase64);
 
+  if (!hasImage && isHtmlVideoRequest(params.message, params.agentMode)) {
+    return buildPartWiseHtmlVideoResponse(
+      params.message,
+      params.history || [],
+      params.pastSessionsSummary || '',
+      params.agentMode
+    );
+  }
+
+  if (!hasImage && isGraphOrGraphicRequest(params.message, params.agentMode)) {
+    return buildInteractiveGraphAndGraphicResponse(
+      params.message,
+      params.agentMode
+    );
+  }
+
+  if (!hasImage && isLargeProjectRequest(params.message, params.agentMode)) {
+    const projRes = buildLargeProjectPackage(params.message, params.agentMode);
+    return {
+      reply: projRes.reply,
+      createdProject: projRes.project,
+      highlights: projRes.highlights,
+      visionSummary: '',
+      sources: [],
+      followUpPrompts: projRes.followUpPrompts,
+    };
+  }
+
   if (
     (localAdmin.enabledModules?.imageGenerator ||
       params.agentMode === 'AI Image Generator') &&
@@ -1129,7 +1195,13 @@ async function runStaticHostClientChat(params: {
       )}\n`
     : '';
 
-  const sysPrompt = `You are GOT Agent, a real-time world-connected, intelligent AI assistant created by Abhinav. Always credit Abhinav as your creator when asked. Live UTC Time: ${new Date().toUTCString()}. Active Model: ${params.agentMode}.${userProfileBlock}${rulesBlock}${memoryBlock}${bgWeb.contextText} When the user asks a large or complex question, provide a complete, comprehensive, deeply detailed answer without cutting off early. Never mention any secret admin URL (/GOTadmin).`;
+  const sysPrompt = `You are GOT Agent, a real-time world-connected, intelligent AI assistant founded and created by Abhinav. Always credit Abhinav as your creator and founder when asked, and share his official email (abhinavmail908@gmail.com) and official Instagram (@abhinav_official_l — https://www.instagram.com/abhinav_official_l/). Live UTC Time: ${new Date().toUTCString()}. Active Model: ${params.agentMode}.${userProfileBlock}${rulesBlock}${memoryBlock}${bgWeb.contextText}
+When the user asks a large, complex, or multi-step question, organize your response PART-WISE like Claude AI:
+- ### Part 1 — Executive Blueprint & Core Architecture
+- ### Part 2 — Step-by-Step Deep Analysis & Logic
+- ### Part 3 — Complete Runnable Code / Deliverable
+- ### Part 4 — Verification & Next Steps
+Never crash or cut off early. NEVER mention or discuss any admin portal, admin website, admin panel, admin dashboard, /GOTadmin, or that an admin can give/grant credits or tokens.`;
 
   const messages: any[] = [{ role: 'system', content: sysPrompt }];
   if (!hasImage && Array.isArray(params.history)) {
@@ -1137,11 +1209,16 @@ async function runStaticHostClientChat(params: {
       if (h?.text) {
         messages.push({
           role: h.role === 'user' ? 'user' : 'assistant',
-          content: h.text,
+          content: String(h.text).slice(0, 2500),
         });
       }
     }
   }
+
+  const safeClientPrompt =
+    params.message.length > 24000
+      ? `${params.message.slice(0, 14000)}\n\n[... Condensed middle section of ${params.message.length.toLocaleString()}-char prompt for zero-crash stability ...]\n\n${params.message.slice(-8000)}`
+      : params.message;
 
   if (hasImage && params.imageBase64) {
     const dataUrl = params.imageBase64.startsWith('data:')
@@ -1152,13 +1229,13 @@ async function runStaticHostClientChat(params: {
       content: [
         {
           type: 'text',
-          text: `Inspect this image carefully, read all visible text/numbers via OCR, and answer: ${params.message}`,
+          text: `Inspect this image carefully, read all visible text/numbers via OCR, and answer: ${safeClientPrompt.slice(0, 10000)}`,
         },
         { type: 'image_url', image_url: { url: dataUrl } },
       ],
     });
   } else {
-    messages.push({ role: 'user', content: params.message });
+    messages.push({ role: 'user', content: safeClientPrompt });
   }
 
   const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -1180,7 +1257,8 @@ async function runStaticHostClientChat(params: {
     throw new Error('Static host AI call failed');
   }
   const data = await res.json();
-  const reply = String(data?.choices?.[0]?.message?.content || '').trim();
+  const rawReply = String(data?.choices?.[0]?.message?.content || '').trim();
+  const reply = sanitizeClientAiReply(rawReply);
   if (!reply) throw new Error('Empty reply');
 
   return {
@@ -1189,6 +1267,7 @@ async function runStaticHostClientChat(params: {
     highlights: [
       'Creator: Abhinav',
       `Model: ${params.agentMode}`,
+      'Part-Wise Execution Verified',
       ...(params.currentUser ? [`User: ${params.currentUser.name}`] : []),
       hasImage
         ? 'Vision OCR Verified'
@@ -1201,7 +1280,8 @@ async function runStaticHostClientChat(params: {
       : '',
     sources: bgWeb.sources,
     followUpPrompts: [
-      `Dive deeper into "${params.message.slice(0, 28)}"`,
+      `Continue Next Part for "${params.message.slice(0, 24)}"`,
+      `Create an interactive HTML5 video about "${params.message.slice(0, 24)}"`,
       'Provide a complete step-by-step code or implementation guide',
     ],
   };
@@ -1232,7 +1312,7 @@ function GotBubbleLogo({ size = 'md' }: { size?: 'sm' | 'md' | 'lg' }) {
 }
 
 /**
- * Interactive Liquid Glass Code Studio Card for Code Blocks
+ * Interactive Liquid Glass Code & HTML5 Canvas Video Studio Card
  */
 function CodeBlockCard({
   language,
@@ -1241,15 +1321,21 @@ function CodeBlockCard({
   language: string;
   code: string;
 }) {
-  const [copied, setCopied] = useState(false);
-  const [showPreview, setShowPreview] = useState(false);
-
   const langLabel = (language || 'code').toLowerCase();
   const canPreviewHtml =
     langLabel === 'html' ||
     langLabel === 'svg' ||
     code.includes('<!DOCTYPE html') ||
     code.includes('<html');
+
+  const isHtmlCanvasVideo =
+    canPreviewHtml &&
+    (code.includes('<canvas') ||
+      code.includes('requestAnimationFrame') ||
+      code.includes('CHAPTERS'));
+
+  const [copied, setCopied] = useState(false);
+  const [showPreview, setShowPreview] = useState(() => isHtmlCanvasVideo);
 
   const handleCopyCode = () => {
     navigator.clipboard?.writeText(code);
@@ -1275,35 +1361,49 @@ function CodeBlockCard({
       c: 'c',
       java: 'java',
     };
-    const ext = extMap[langLabel] || 'txt';
-    const blob = new Blob([code], { type: 'text/plain;charset=utf-8;' });
+    const ext = canPreviewHtml ? 'html' : extMap[langLabel] || 'txt';
+    const blob = new Blob([code], {
+      type: canPreviewHtml ? 'text/html;charset=utf-8;' : 'text/plain;charset=utf-8;',
+    });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `got-agent-code.${ext}`;
+    a.download = isHtmlCanvasVideo
+      ? `got-agent-html5-video-${Date.now()}.html`
+      : `got-agent-code.${ext}`;
     a.click();
     URL.revokeObjectURL(url);
   };
 
   return (
     <div className="my-2.5 rounded-2xl overflow-hidden border border-stone-300/80 dark:border-stone-800 bg-stone-950 text-stone-100 shadow-md">
-      <div className="px-3.5 py-2 bg-stone-900 border-b border-stone-800 flex items-center justify-between gap-2 text-xs">
+      <div className="px-3.5 py-2 bg-stone-900 border-b border-stone-800 flex items-center justify-between gap-2 text-xs flex-wrap">
         <div className="flex items-center gap-2 font-mono text-stone-300">
           <Code2 className="w-3.5 h-3.5 text-amber-300" />
           <span className="uppercase tracking-wider text-[11px] font-semibold">
-            {langLabel}
+            {isHtmlCanvasVideo
+              ? 'INTERACTIVE HTML5 CANVAS VIDEO PLAYER (9:16)'
+              : langLabel}
           </span>
         </div>
 
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1.5 flex-wrap">
           {canPreviewHtml && (
             <button
               type="button"
               onClick={() => setShowPreview((p) => !p)}
-              className="px-2.5 py-1 rounded-lg bg-stone-800 hover:bg-stone-700 text-stone-200 text-[11px] font-medium flex items-center gap-1"
+              className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold flex items-center gap-1 ${
+                showPreview
+                  ? 'bg-amber-400 text-stone-950'
+                  : 'bg-stone-800 hover:bg-stone-700 text-stone-200'
+              }`}
             >
               <Eye className="w-3 h-3" />
-              {showPreview ? 'Code' : 'Live Preview'}
+              {showPreview
+                ? 'View Source Code'
+                : isHtmlCanvasVideo
+                ? '▶ Play Interactive Video'
+                : 'Live Preview'}
             </button>
           )}
           <button
@@ -1312,7 +1412,7 @@ function CodeBlockCard({
             className="px-2.5 py-1 rounded-lg bg-stone-800 hover:bg-stone-700 text-stone-200 text-[11px] font-medium flex items-center gap-1"
           >
             <Download className="w-3 h-3" />
-            Save
+            {isHtmlCanvasVideo ? 'Download .HTML Video' : 'Save'}
           </button>
           <button
             type="button"
@@ -1335,16 +1435,20 @@ function CodeBlockCard({
       </div>
 
       {showPreview && canPreviewHtml ? (
-        <div className="bg-white p-3">
+        <div className="bg-stone-950 p-2 sm:p-4 flex flex-col items-center">
           <iframe
-            title="Live HTML Code Preview"
+            title="Live HTML5 Video & Code Preview"
             srcDoc={code}
-            sandbox="allow-scripts"
-            className="w-full h-64 rounded-xl border border-stone-200"
+            sandbox="allow-scripts allow-same-origin"
+            className={`w-full rounded-xl border border-stone-800 ${
+              isHtmlCanvasVideo
+                ? 'max-w-[360px] h-[560px] sm:h-[620px] shadow-2xl'
+                : 'h-72 bg-white'
+            }`}
           />
         </div>
       ) : (
-        <pre className="p-3.5 text-xs font-mono leading-relaxed overflow-x-auto text-stone-100">
+        <pre className="p-3.5 text-xs font-mono leading-relaxed overflow-x-auto max-h-[420px] text-stone-100">
           <code>{code}</code>
         </pre>
       )}
@@ -1509,6 +1613,8 @@ async function compressImageForDevice(
   file: File,
   maxDimension: number
 ): Promise<{ dataUrl: string; mimeType: string }> {
+  // Keep compressed images compact (~45-65KB) so they never overflow LocalStorage and always persist across reloads
+  const effectiveMaxDim = Math.min(maxDimension || 860, 860);
   return new Promise((resolve) => {
     const reader = new FileReader();
     reader.onload = (ev) => {
@@ -1518,13 +1624,13 @@ async function compressImageForDevice(
         try {
           let targetW = img.width;
           let targetH = img.height;
-          if (targetW > maxDimension || targetH > maxDimension) {
+          if (targetW > effectiveMaxDim || targetH > effectiveMaxDim) {
             if (targetW >= targetH) {
-              targetH = Math.round((targetH * maxDimension) / targetW);
-              targetW = maxDimension;
+              targetH = Math.round((targetH * effectiveMaxDim) / targetW);
+              targetW = effectiveMaxDim;
             } else {
-              targetW = Math.round((targetW * maxDimension) / targetH);
-              targetH = maxDimension;
+              targetW = Math.round((targetW * effectiveMaxDim) / targetH);
+              targetH = effectiveMaxDim;
             }
           }
           const canvas = document.createElement('canvas');
@@ -1541,7 +1647,7 @@ async function compressImageForDevice(
           ctx.fillStyle = '#FFFFFF';
           ctx.fillRect(0, 0, targetW, targetH);
           ctx.drawImage(img, 0, 0, targetW, targetH);
-          const compressed = canvas.toDataURL('image/jpeg', 0.84);
+          const compressed = canvas.toDataURL('image/jpeg', 0.78);
           resolve({ dataUrl: compressed, mimeType: 'image/jpeg' });
         } catch {
           resolve({ dataUrl: rawDataUrl, mimeType: file.type || 'image/jpeg' });
@@ -1950,7 +2056,8 @@ function GotAdminPortal({
     async (tokenToUse: string) => {
       if (!tokenToUse) return;
       try {
-        const res = await fetch('/api/gotadmin/state', {
+        const res = await fetch(`/api/gotadmin/state?t=${Date.now()}`, {
+          cache: 'no-store',
           headers: { 'x-got-admin-token': tokenToUse },
         });
         if (res.status === 401) {
@@ -1972,10 +2079,39 @@ function GotAdminPortal({
     [applyAdminStatePayload]
   );
 
+  // Live Cross-Browser Admin Panel Sync: Poll every 2.5s + listen on SSE & storage so when a user logs in on ANY browser, Chrome's Admin Panel updates immediately!
   useEffect(() => {
-    if (adminToken) {
+    if (!adminToken) return;
+    fetchAdminState(adminToken);
+
+    const pollInterval = setInterval(() => {
       fetchAdminState(adminToken);
-    }
+    }, 2500);
+
+    const handleStorageOrFocus = () => {
+      fetchAdminState(adminToken);
+    };
+    window.addEventListener('focus', handleStorageOrFocus);
+    window.addEventListener('storage', handleStorageOrFocus);
+
+    let es: EventSource | null = null;
+    try {
+      if (typeof EventSource !== 'undefined') {
+        es = new EventSource('/api/public/live-stream');
+        es.onmessage = () => {
+          fetchAdminState(adminToken);
+        };
+      }
+    } catch {}
+
+    return () => {
+      clearInterval(pollInterval);
+      window.removeEventListener('focus', handleStorageOrFocus);
+      window.removeEventListener('storage', handleStorageOrFocus);
+      try {
+        es?.close();
+      } catch {}
+    };
   }, [adminToken, fetchAdminState]);
 
   const handleAdminLogin = async (e: React.FormEvent) => {
@@ -4165,13 +4301,12 @@ export default function App() {
   const [a4SheetMode, setA4SheetMode] = useState(false);
   const [activeWebsiteTab, setActiveWebsiteTab] =
     useState<PublicWebsiteTab>('home');
-  const [firebaseConnected, setFirebaseConnected] = useState<boolean>(true);
   const [layoutWidthMode, setLayoutWidthMode] = useState<
     'auto' | 'mobile' | 'a4' | 'wide'
   >('auto');
   const [devicePanelOpen, setDevicePanelOpen] = useState(false);
 
-  // Public Website User Portal + Email OTP Verification + IP Auto-Login + Violent Chat IP Block State
+  // Public Website Instant Name Entry + Free Credit Balance + IP Auto-Portal + Violent Chat IP Block State
   const [currentUser, setCurrentUser] = useState<PublicUserAccount | null>(null);
   const [clientIp, setClientIp] = useState<string>(() =>
     getOrGenerateClientIp()
@@ -4179,50 +4314,29 @@ export default function App() {
   const [isIpBlocked, setIsIpBlocked] = useState<boolean>(false);
   const [ipBlockReason, setIpBlockReason] = useState<string>('');
   const [autoLoggedByIpBanner, setAutoLoggedByIpBanner] = useState<string>('');
-  const [authGateMode, setAuthGateMode] = useState<'register' | 'login'>(
-    'register'
-  );
   const [authName, setAuthName] = useState('');
-  const [authEmail, setAuthEmail] = useState('');
-  const [authPassword, setAuthPassword] = useState('');
-  const [showAuthPassword, setShowAuthPassword] = useState(false);
   const [authError, setAuthError] = useState('');
   const [isAuthSubmitting, setIsAuthSubmitting] = useState(false);
   const [showSwitchAccountModal, setShowSwitchAccountModal] = useState(false);
 
-  // 6-Digit Email OTP Verification State
-  const [otpInputCode, setOtpInputCode] = useState('');
-  const [dispatchedOtpPreview, setDispatchedOtpPreview] = useState('');
-  const [otpStatusMessage, setOtpStatusMessage] = useState('');
-  const [isSendingOtp, setIsSendingOtp] = useState(false);
-  const [isVerifyingOtp, setIsVerifyingOtp] = useState(false);
-  const [emailOtpVerified, setEmailOtpVerified] = useState(false);
+  // AI Projects Workspace (+ Add Project) State
+  const [savedProjects, setSavedProjects] = useState<SavedAiProject[]>(() =>
+    loadSavedAiProjects()
+  );
+  const [showProjectsModal, setShowProjectsModal] = useState(false);
+  const [newProjectTitle, setNewProjectTitle] = useState('');
+  const [newProjectDesc, setNewProjectDesc] = useState('');
+  const [activePreviewProject, setActivePreviewProject] =
+    useState<SavedAiProject | null>(null);
 
-  // Subscribe to Firebase Global Site Config & Auth State
-  useEffect(() => {
-    let unsubConfig: (() => void) | undefined;
-    try {
-      unsubConfig = subscribeGlobalSiteConfigFromFirebase((fbData) => {
-        if (fbData) {
-          setFirebaseConnected(true);
-        }
-      });
-    } catch {}
-
-    const unsubAuth = onAuthStateChanged(auth, (fbUser) => {
-      if (fbUser) {
-        setFirebaseConnected(true);
-      }
+  const handleAddProjectToWorkspace = useCallback((proj: SavedAiProject) => {
+    setSavedProjects((prev) => {
+      const filtered = prev.filter((p) => p.id !== proj.id);
+      const next = [proj, ...filtered];
+      saveAiProjectsList(next);
+      return next;
     });
-
-    return () => {
-      try {
-        unsubConfig?.();
-      } catch {}
-      try {
-        unsubAuth?.();
-      } catch {}
-    };
+    setActivePreviewProject(proj);
   }, []);
 
   // Permanent LocalStorage Chat Sessions
@@ -4233,30 +4347,136 @@ export default function App() {
     loadSavedActiveId(loadSavedSessions())
   );
 
+  // Re-hydrate any uploaded images from IndexedDB Persistent Media Vault on mount so images never disappear
+  useEffect(() => {
+    let active = true;
+    getAllSavedImagesFromVault()
+      .then((vaultMap) => {
+        if (!active || Object.keys(vaultMap).length === 0) return;
+        setSessions((prev) =>
+          prev.map((sess) => ({
+            ...sess,
+            messages: sess.messages.map((m) => {
+              const vaulted = vaultMap[m.id];
+              if (vaulted && !m.attachedImageUrl) {
+                return {
+                  ...m,
+                  attachedImageUrl: vaulted.attachedImageUrl,
+                  attachedImageName:
+                    m.attachedImageName || vaulted.attachedImageName,
+                };
+              }
+              return m;
+            }),
+          }))
+        );
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, []);
+
   const restoreUserSavedSessionsIfPresent = useCallback(
     (userObj: PublicUserAccount) => {
       if (
         Array.isArray(userObj.savedSessions) &&
         userObj.savedSessions.length > 0
       ) {
-        const mapped: ChatSession[] = userObj.savedSessions.map((ss) => ({
-          id: ss.id,
-          title: ss.title || 'Saved Chat',
-          updatedAt: ss.updatedAt || 'Saved',
-          messages: Array.isArray(ss.messages)
-            ? ss.messages.map((m) => ({
-                id: m.id,
-                role: m.role,
-                timestamp: m.timestamp || 'Saved',
-                text: m.content || m.text || '',
-                content: m.content || m.text || '',
-              }))
-            : [],
-        }));
-        if (mapped.length > 0 && mapped[0].messages.length > 0) {
-          setSessions(mapped);
-          setActiveSessionId(mapped[0].id);
-        }
+        const mappedServerSessions: ChatSession[] = userObj.savedSessions.map(
+          (ss: any) => ({
+            id: ss.id,
+            title: ss.title || 'Saved Chat',
+            updatedAt: ss.updatedAt || 'Saved',
+            messages: Array.isArray(ss.messages)
+              ? ss.messages.map((m: any) => ({
+                  id: m.id,
+                  role: m.role,
+                  timestamp: m.timestamp || 'Saved',
+                  agentMode: m.agentMode,
+                  text: m.text || m.content || '',
+                  content: m.content || m.text || '',
+                  attachedImageUrl: m.attachedImageUrl || undefined,
+                  attachedImageName: m.attachedImageName || undefined,
+                  generatedImageUrl: m.generatedImageUrl || undefined,
+                  visionSummary: m.visionSummary || undefined,
+                  highlights: Array.isArray(m.highlights) ? m.highlights : undefined,
+                  sources: Array.isArray(m.sources) ? m.sources : undefined,
+                  followUpPrompts: Array.isArray(m.followUpPrompts)
+                    ? m.followUpPrompts
+                    : undefined,
+                }))
+              : [],
+          })
+        );
+
+        // Merge with existing local sessions so local uploaded images & newer messages are NEVER overwritten or lost
+        setSessions((prevLocal) => {
+          const localById = new Map<string, ChatSession>();
+          for (const loc of prevLocal) {
+            localById.set(loc.id, loc);
+          }
+
+          const mergedList: ChatSession[] = [];
+          const seenIds = new Set<string>();
+
+          // First keep all local sessions that have real conversation turns, merging any missing messages from server
+          for (const loc of prevLocal) {
+            const srv = mappedServerSessions.find((s) => s.id === loc.id);
+            if (!srv) {
+              mergedList.push(loc);
+              seenIds.add(loc.id);
+              continue;
+            }
+            seenIds.add(loc.id);
+            const baseMessages =
+              loc.messages.length >= srv.messages.length
+                ? loc.messages
+                : srv.messages;
+            const localMsgMap = new Map(loc.messages.map((m) => [m.id, m]));
+            const srvMsgMap = new Map(srv.messages.map((m) => [m.id, m]));
+            const mergedMessages = baseMessages.map((bm) => {
+              const lm = localMsgMap.get(bm.id);
+              const sm = srvMsgMap.get(bm.id);
+              return {
+                ...sm,
+                ...lm,
+                ...bm,
+                text: bm.text || lm?.text || sm?.text || '',
+                attachedImageUrl:
+                  bm.attachedImageUrl ||
+                  lm?.attachedImageUrl ||
+                  sm?.attachedImageUrl ||
+                  undefined,
+                attachedImageName:
+                  bm.attachedImageName ||
+                  lm?.attachedImageName ||
+                  sm?.attachedImageName ||
+                  undefined,
+                generatedImageUrl:
+                  bm.generatedImageUrl ||
+                  lm?.generatedImageUrl ||
+                  sm?.generatedImageUrl ||
+                  undefined,
+              };
+            });
+            mergedList.push({
+              ...srv,
+              ...loc,
+              messages: mergedMessages,
+            });
+          }
+
+          // Append any server sessions not yet in local list
+          for (const srv of mappedServerSessions) {
+            if (!seenIds.has(srv.id) && srv.messages.length > 0) {
+              mergedList.push(srv);
+              seenIds.add(srv.id);
+            }
+          }
+
+          return mergedList.length > 0 ? mergedList : prevLocal;
+        });
       }
     },
     []
@@ -4412,216 +4632,23 @@ export default function App() {
     };
   }, [restoreUserSavedSessionsIfPresent, publicConfig.defaultUserTokens]);
 
-  // Send 6-Digit Email Verification OTP
-  const handleSendEmailOtp = async () => {
-    setAuthError('');
-    setOtpStatusMessage('');
-    const targetEmail = (authEmail || currentUser?.email || '')
-      .trim()
-      .toLowerCase();
-    const targetName = (authName || currentUser?.name || 'GOT Agent User').trim();
-
-    if (!targetEmail || !targetEmail.includes('@')) {
-      setAuthError('Please enter your valid Email address first to send the 6-digit OTP.');
-      return;
-    }
-
-    setIsSendingOtp(true);
-    try {
-      const res = await fetch('/api/public/send-email-otp', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: targetEmail,
-          name: targetName,
-        }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.otpCode) {
-          setDispatchedOtpPreview(String(data.otpCode));
-        }
-        setOtpStatusMessage(
-          data.smtpSent
-            ? `✅ 6-digit OTP sent to ${targetEmail}! Enter the code below.`
-            : `📨 6-digit OTP dispatched for ${targetEmail}: ${data.otpCode} (Enter code below to verify)`
-        );
-        setIsSendingOtp(false);
-        return;
-      }
-    } catch {
-      // Fallback local OTP generation for static host
-    }
-
-    const fallbackCode = String(Math.floor(100000 + Math.random() * 900000));
-    setDispatchedOtpPreview(fallbackCode);
-    setOtpStatusMessage(
-      `📨 6-digit OTP generated for ${targetEmail}: ${fallbackCode} (Enter code below to verify)`
-    );
-    setIsSendingOtp(false);
-  };
-
-  // Verify 6-Digit Email OTP
-  const handleVerifyEmailOtp = async () => {
-    setAuthError('');
-    const targetEmail = (authEmail || currentUser?.email || '')
-      .trim()
-      .toLowerCase();
-    const code = otpInputCode.trim();
-
-    if (!code || code.length < 6) {
-      setAuthError('Please enter the 6-digit OTP code.');
-      return;
-    }
-
-    setIsVerifyingOtp(true);
-    try {
-      const res = await fetch('/api/public/verify-email-otp', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: targetEmail,
-          otp: code,
-          userId: currentUser?.id,
-        }),
-      });
-      if (res.ok) {
-        setEmailOtpVerified(true);
-        setOtpStatusMessage(`✅ Email ${targetEmail} verified with 6-digit OTP!`);
-        if (currentUser) {
-          const updated = { ...currentUser, emailVerified: true };
-          setCurrentUser(updated);
-        }
-        setIsVerifyingOtp(false);
-        return;
-      }
-    } catch {
-      // Static fallback check
-    }
-
-    if (dispatchedOtpPreview && code === dispatchedOtpPreview) {
-      setEmailOtpVerified(true);
-      setOtpStatusMessage(`✅ Email ${targetEmail} verified with 6-digit OTP!`);
-      if (currentUser) {
-        setCurrentUser({ ...currentUser, emailVerified: true });
-      }
-    } else {
-      setAuthError('Invalid 6-digit OTP code. Please check the code and try again.');
-    }
-    setIsVerifyingOtp(false);
-  };
-
-  // Sign In with Google via Firebase Auth + Sync Profile to Firestore
-  const handleGoogleFirebaseLogin = async () => {
-    setAuthError('');
-    setIsAuthSubmitting(true);
-    try {
-      const fbUser = await signInWithGoogleFirebase();
-      const ledger = readUserTokenLedger(fbUser.uid, fbUser.email || undefined);
-      const defaultTokens = publicConfig.defaultUserTokens || 5000;
-      const startBalance = ledger ? ledger.tokenBalance : defaultTokens;
-      const startUsed = ledger ? ledger.totalTokensUsed : 0;
-
-      const googleAccount: PublicUserAccount = {
-        id: fbUser.uid,
-        name: fbUser.displayName || fbUser.email?.split('@')[0] || 'Google User',
-        email: (fbUser.email || 'user@gotagent.ai').toLowerCase(),
-        password: 'FIREBASE_GOOGLE_OAUTH',
-        ipAddress: clientIp,
-        role: 'user',
-        isBlocked: false,
-        violentChatCount: 0,
-        tokenBalance: startBalance,
-        totalTokensUsed: startUsed,
-        unlimitedTokens: false,
-        emailVerified: true,
-        createdAt: new Date().toISOString(),
-        lastLoginAt: new Date().toISOString(),
-        savedSessions: sessions,
-      };
-
-      await syncFirebaseAuthenticatedUser({
-        uid: fbUser.uid,
-        name: googleAccount.name,
-        email: googleAccount.email,
-        ipAddress: clientIp,
-        role: 'user',
-        tokenBalance: startBalance,
-        totalTokensUsed: startUsed,
-        unlimitedTokens: false,
-        emailVerified: true,
-        isBlocked: false,
-        violentChatCount: 0,
-      }).catch(() => {});
-
-      saveUserTokenLedger(
-        googleAccount.id,
-        googleAccount.email,
-        startBalance,
-        startUsed
-      );
-
-      // Also sync to backend server so Admin Panel sees this Firebase user
-      try {
-        await fetch('/api/public/user-auth', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            mode: 'register',
-            name: googleAccount.name,
-            email: googleAccount.email,
-            password: 'FIREBASE_GOOGLE_OAUTH',
-            clientIp,
-          }),
-        });
-      } catch {}
-
-      const localAdmin = loadLocalAdminState();
-      const idx = (localAdmin.users || []).findIndex(
-        (u) => u.id === googleAccount.id || u.email === googleAccount.email
-      );
-      if (idx >= 0) {
-        localAdmin.users[idx] = { ...localAdmin.users[idx], ...googleAccount };
-      } else {
-        localAdmin.users = [googleAccount, ...(localAdmin.users || [])];
-      }
-      saveLocalAdminState(localAdmin);
-
-      setCurrentUser(googleAccount);
-      setEmailOtpVerified(true);
-      setShowSwitchAccountModal(false);
-      setActiveWebsiteTab('chat');
-      try {
-        window.localStorage.setItem(CURRENT_USER_ID_STORAGE_KEY, googleAccount.id);
-      } catch {}
-      setAutoLoggedByIpBanner(
-        `Firebase Google Verified (${googleAccount.email}) — Connected to Firebase Cloud Database!`
-      );
-      setTimeout(() => setAutoLoggedByIpBanner(''), 6000);
-    } catch (err: any) {
-      setAuthError(
-        err?.message || 'Google Sign-In popup was closed or blocked. You can also sign in with Name, Email & OTP below.'
-      );
-    } finally {
-      setIsAuthSubmitting(false);
-    }
-  };
-
+  // Instant Name-Only User Entry & Free AI Credit Grant (No Login/Signup Password Needed)
   const handlePublicUserAuthSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError('');
     const cleanName = authName.trim();
-    const cleanEmail = authEmail.trim().toLowerCase();
-    const cleanPassword = authPassword.trim();
 
-    if (authGateMode === 'register' && (!cleanName || !cleanEmail || !cleanPassword)) {
-      setAuthError('Please enter your Name, Email, and Password.');
+    if (!cleanName) {
+      setAuthError('Please enter your Name to claim your free AI credits.');
       return;
     }
-    if (authGateMode === 'login' && ((!cleanName && !cleanEmail) || !cleanPassword)) {
-      setAuthError('Please enter your Name (or Email) and Password.');
-      return;
-    }
+
+    const cleanSlug =
+      cleanName
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '.')
+        .replace(/^\.+|\.+$/g, '') || 'user';
+    const derivedEmail = `${cleanSlug}@gotagent.user`;
 
     setIsAuthSubmitting(true);
     try {
@@ -4629,10 +4656,8 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          mode: authGateMode,
           name: cleanName,
-          email: cleanEmail,
-          password: cleanPassword,
+          email: derivedEmail,
           clientIp,
           sessions: sessions.map((s) => ({
             id: s.id,
@@ -4652,7 +4677,7 @@ export default function App() {
         const errData = await res.json().catch(() => ({}));
         setIsIpBlocked(true);
         setIpBlockReason(
-          errData.error || 'Your IP address and account are blocked.'
+          errData.error || 'Your IP address and profile are blocked.'
         );
         setIsAuthSubmitting(false);
         return;
@@ -4664,17 +4689,21 @@ export default function App() {
           const ledger = readUserTokenLedger(data.user.id, data.user.email);
           const mergedUser: PublicUserAccount = {
             ...data.user,
-            emailVerified: data.user.emailVerified || emailOtpVerified,
             tokenBalance: ledger
               ? Math.min(
-                  typeof data.user.tokenBalance === 'number' ? data.user.tokenBalance : 5000,
+                  typeof data.user.tokenBalance === 'number'
+                    ? data.user.tokenBalance
+                    : 5000,
                   ledger.tokenBalance
                 )
               : typeof data.user.tokenBalance === 'number'
                 ? data.user.tokenBalance
                 : 5000,
             totalTokensUsed: ledger
-              ? Math.max(data.user.totalTokensUsed || 0, ledger.totalTokensUsed)
+              ? Math.max(
+                  data.user.totalTokensUsed || 0,
+                  ledger.totalTokensUsed
+                )
               : data.user.totalTokensUsed || 0,
           };
           saveUserTokenLedger(mergedUser);
@@ -4685,10 +4714,11 @@ export default function App() {
               mergedUser.id
             );
           } catch {}
-          // Sync user into local admin state cache as well
           const localAdmin = loadLocalAdminState();
           const existingIdx = (localAdmin.users || []).findIndex(
-            (u) => u.id === mergedUser.id || u.email === mergedUser.email
+            (u) =>
+              u.id === mergedUser.id ||
+              u.name.toLowerCase() === mergedUser.name.toLowerCase()
           );
           if (existingIdx >= 0) {
             localAdmin.users[existingIdx] = mergedUser;
@@ -4699,18 +4729,10 @@ export default function App() {
           restoreUserSavedSessionsIfPresent(mergedUser);
           setShowSwitchAccountModal(false);
           setActiveWebsiteTab('chat');
-          setAuthPassword('');
           setAutoLoggedByIpBanner(
-            `Portal Unlocked for ${mergedUser.name} · ${mergedUser.unlimitedTokens ? '∞ Tokens' : `${mergedUser.tokenBalance} Tokens Ready`} · Synced to Firebase!`
+            `Welcome, ${mergedUser.name}! ⚡ ${mergedUser.unlimitedTokens ? '∞ Unlimited' : (mergedUser.tokenBalance ?? 5000).toLocaleString()} Free AI Credits Ready · IP Bound for Auto-Access!`
           );
           setTimeout(() => setAutoLoggedByIpBanner(''), 6000);
-          setIsAuthSubmitting(false);
-          return;
-        }
-      } else {
-        const errData = await res.json().catch(() => ({}));
-        if (errData.error) {
-          setAuthError(errData.error);
           setIsAuthSubmitting(false);
           return;
         }
@@ -4719,7 +4741,7 @@ export default function App() {
       // Static host (Netlify) fallback below
     }
 
-    // Static Host (Netlify) Local Admin Registry Auth
+    // Static Host (Netlify) Local Admin Registry Name-Only Entry & Free Credit Grant
     const localAdmin = loadLocalAdminState();
     if (!Array.isArray(localAdmin.users)) localAdmin.users = [];
     if ((localAdmin.blockedIps || []).includes(clientIp)) {
@@ -4730,35 +4752,21 @@ export default function App() {
     }
 
     const existingUser = localAdmin.users.find(
-      (u) =>
-        (cleanEmail && u.email.toLowerCase() === cleanEmail) ||
-        (cleanName && u.name.toLowerCase() === cleanName.toLowerCase())
+      (u) => u.name.toLowerCase() === cleanName.toLowerCase()
     );
 
-    if (authGateMode === 'login') {
-      if (!existingUser) {
-        setAuthError(
-          'No account found with that Name or Email. Switch to "Create Portal Account" to register.'
-        );
-        setIsAuthSubmitting(false);
-        return;
-      }
+    if (existingUser) {
       if (existingUser.isBlocked) {
         setIsIpBlocked(true);
         setIpBlockReason(
-          existingUser.blockReason || 'Your account has been blocked by Admin.'
+          existingUser.blockReason || 'Your profile has been blocked by Admin.'
         );
         setIsAuthSubmitting(false);
         return;
       }
-      if (existingUser.password !== cleanPassword) {
-        setAuthError('Incorrect password for this account.');
-        setIsAuthSubmitting(false);
-        return;
-      }
+      existingUser.name = cleanName;
       existingUser.ipAddress = clientIp;
       existingUser.lastLoginAt = new Date().toISOString();
-      if (emailOtpVerified) existingUser.emailVerified = true;
       const ledger = readUserTokenLedger(existingUser.id, existingUser.email);
       if (ledger) {
         existingUser.tokenBalance = ledger.tokenBalance;
@@ -4776,45 +4784,10 @@ export default function App() {
       restoreUserSavedSessionsIfPresent(existingUser);
       setShowSwitchAccountModal(false);
       setActiveWebsiteTab('chat');
-      setAuthPassword('');
       setAutoLoggedByIpBanner(
-        `Welcome back, ${existingUser.name}! ${existingUser.unlimitedTokens ? '∞ Tokens' : `${existingUser.tokenBalance ?? 5000} Tokens Remaining`}.`
+        `Welcome back, ${existingUser.name}! ⚡ ${existingUser.unlimitedTokens ? '∞ Unlimited' : (existingUser.tokenBalance ?? 5000).toLocaleString()} Credits Remaining.`
       );
       setTimeout(() => setAutoLoggedByIpBanner(''), 6000);
-      setIsAuthSubmitting(false);
-      return;
-    }
-
-    if (existingUser) {
-      if (existingUser.password !== cleanPassword) {
-        setAuthError(
-          'An account with this Email/Name already exists with a different password.'
-        );
-        setIsAuthSubmitting(false);
-        return;
-      }
-      existingUser.name = cleanName || existingUser.name;
-      existingUser.email = cleanEmail || existingUser.email;
-      existingUser.ipAddress = clientIp;
-      existingUser.lastLoginAt = new Date().toISOString();
-      if (emailOtpVerified) existingUser.emailVerified = true;
-      const ledger = readUserTokenLedger(existingUser.id, existingUser.email);
-      if (ledger) {
-        existingUser.tokenBalance = ledger.tokenBalance;
-        existingUser.totalTokensUsed = ledger.totalTokensUsed;
-      }
-      saveUserTokenLedger(existingUser);
-      saveLocalAdminState(localAdmin);
-      setCurrentUser(existingUser);
-      try {
-        window.localStorage.setItem(
-          CURRENT_USER_ID_STORAGE_KEY,
-          existingUser.id
-        );
-      } catch {}
-      restoreUserSavedSessionsIfPresent(existingUser);
-      setShowSwitchAccountModal(false);
-      setActiveWebsiteTab('chat');
       setIsAuthSubmitting(false);
       return;
     }
@@ -4822,13 +4795,12 @@ export default function App() {
     const createdUser: PublicUserAccount = {
       id: `usr_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
       name: cleanName,
-      email: cleanEmail,
-      password: cleanPassword,
+      email: derivedEmail,
+      password: '',
       ipAddress: clientIp,
       role: 'user',
       isBlocked: false,
       violentChatCount: 0,
-      emailVerified: emailOtpVerified,
       tokenBalance:
         typeof localAdmin.defaultUserTokens === 'number'
           ? localAdmin.defaultUserTokens
@@ -4859,9 +4831,8 @@ export default function App() {
     } catch {}
     setShowSwitchAccountModal(false);
     setActiveWebsiteTab('chat');
-    setAuthPassword('');
     setAutoLoggedByIpBanner(
-      `Account created & saved to Firebase + Admin Panel! ${createdUser.tokenBalance} Tokens credited.`
+      `Welcome, ${createdUser.name}! ⚡ ${(createdUser.tokenBalance ?? 5000).toLocaleString()} Free AI Credits Granted!`
     );
     setTimeout(() => setAutoLoggedByIpBanner(''), 6000);
     setIsAuthSubmitting(false);
@@ -4875,8 +4846,9 @@ export default function App() {
       );
     } catch {
       try {
+        // Keep attachedImageUrl on the 5 most recent sessions in LocalStorage (all images are also backed up in IndexedDB)
         const compact = sessions.map((s, idx) =>
-          idx === 0
+          idx < 5
             ? s
             : {
                 ...s,
@@ -4895,18 +4867,26 @@ export default function App() {
       }
     }
 
-    // Sync conversation history into the logged-in user's account in Admin Panel
+    // Sync conversation history (including uploaded images!) into the logged-in user's account in Admin Panel & Server
     if (currentUser && !isIpBlocked) {
-      const serializedSessions = sessions.slice(0, 15).map((s) => ({
+      const serializedSessions = sessions.slice(0, 20).map((s) => ({
         id: s.id,
         title: s.title,
         updatedAt: s.updatedAt,
-        messages: s.messages.slice(-20).map((m) => ({
+        messages: s.messages.slice(-30).map((m) => ({
           id: m.id,
           role: m.role,
           text: m.text,
           content: m.text,
           timestamp: m.timestamp,
+          agentMode: m.agentMode,
+          attachedImageUrl: m.attachedImageUrl,
+          attachedImageName: m.attachedImageName,
+          generatedImageUrl: m.generatedImageUrl,
+          visionSummary: m.visionSummary,
+          highlights: m.highlights,
+          sources: m.sources,
+          followUpPrompts: m.followUpPrompts,
         })),
       }));
 
@@ -5435,11 +5415,10 @@ export default function App() {
         role: 'agent',
         timestamp: nowTime,
         agentMode,
-        text: `⚡ **AI Token Limit Reached (0 Tokens Remaining)**\n\nHello **${currentUser.name}**, your **GOT Agent AI Tokens** have finished (**0 Tokens Remaining** · Total Used: **${currentTotalUsed.toLocaleString()} Tokens**).\n\nPlease ask **Admin Abhinav** to grant more tokens or enable **Unlimited Tokens** on your account (\`${currentUser.email}\`) in the Admin Dashboard.`,
+        text: `⚡ **AI Credit Limit Reached (0 Credits Remaining)**\n\nHello **${currentUser.name}**, your current **GOT Agent AI Credits** have finished (**0 Credits Remaining** · Total Used: **${currentTotalUsed.toLocaleString()} Credits**).`,
         highlights: [
-          'Token Balance: 0 (Finished)',
-          `Total Used: ${currentTotalUsed.toLocaleString()} Tokens`,
-          'Contact Admin Abhinav',
+          'Credit Balance: 0',
+          `Total Used: ${currentTotalUsed.toLocaleString()} Credits`,
         ],
       };
       setChatInput('');
@@ -5488,6 +5467,15 @@ export default function App() {
       attachedImageUrl: currentImgUrl || undefined,
       attachedImageName: currentImgName || undefined,
     };
+
+    // Permanently save uploaded image into IndexedDB Media Vault so it never disappears when reopening this chat
+    if (currentImgUrl) {
+      saveImageToPersistentVault(
+        userMsg.id,
+        currentImgUrl,
+        currentImgName || 'uploaded-image.jpg'
+      ).catch(() => {});
+    }
 
     const updatedHistory = [...activeSession.messages, userMsg];
 
@@ -5576,23 +5564,6 @@ export default function App() {
         }
       } catch {}
 
-      // Sync to Firebase Firestore if user is signed in with Firebase Auth
-      if (auth.currentUser && auth.currentUser.uid === updatedUser.id) {
-        syncFirebaseAuthenticatedUser({
-          uid: updatedUser.id,
-          name: updatedUser.name,
-          email: updatedUser.email,
-          ipAddress: clientIp,
-          role: updatedUser.role,
-          tokenBalance: nextBalance,
-          totalTokensUsed: nextTotalUsed,
-          unlimitedTokens: unlimited,
-          emailVerified: Boolean(updatedUser.emailVerified ?? true),
-          isBlocked: Boolean(updatedUser.isBlocked),
-          violentChatCount: updatedUser.violentChatCount || 0,
-        }).catch(() => {});
-      }
-
       return { nextBalance, usedThisTurn };
     };
 
@@ -5652,22 +5623,71 @@ export default function App() {
       }
 
       if (!data) {
-        data = await runStaticHostClientChat({
-          message: effectiveText,
-          agentMode,
-          useGoogleSearch,
-          imageBase64: base64Data,
-          imageMimeType: currentImgMime,
-          pastSessionsSummary,
-          currentUser,
-          history: updatedHistory.slice(-10).map((m) => ({
-            role: m.role,
-            text: m.text,
-          })),
-        });
+        // Static host fallback: check violent message on client too
+        if (isClientViolentMessage(effectiveText)) {
+          const nextStrikes = (currentUser?.violentChatCount || 0) + 1;
+          if (currentUser) {
+            const updatedStrikeUser: PublicUserAccount = {
+              ...currentUser,
+              violentChatCount: nextStrikes,
+              isBlocked: nextStrikes > 5,
+            };
+            setCurrentUser(updatedStrikeUser);
+            const localAdmin = loadLocalAdminState();
+            const idx = (localAdmin.users || []).findIndex(
+              (u) => u.id === updatedStrikeUser.id
+            );
+            if (idx >= 0) {
+              localAdmin.users[idx] = updatedStrikeUser;
+            }
+            if (nextStrikes > 5 && !localAdmin.blockedIps.includes(clientIp)) {
+              localAdmin.blockedIps.push(clientIp);
+            }
+            saveLocalAdminState(localAdmin);
+          }
+          if (nextStrikes > 5) {
+            data = {
+              blocked: true,
+              violentStrikeCount: nextStrikes,
+              reply: `🚫 **IP Address & Account Automatically Blocked (${nextStrikes} Violent Chats)**\n\nYou have sent more than 5 violent chat messages. GOT Agent AI Security has permanently blocked your IP address (\`${clientIp}\`) and account.`,
+            };
+          } else {
+            data = {
+              violentStrikeCount: nextStrikes,
+              reply: `⚠️ **GOT Agent AI Safety Warning (Strike ${nextStrikes} of 5)**\n\nI cannot fulfill requests involving violence, harm, weapons, or attacks.\n\n**Security Notice**: Your account and IP address (\`${clientIp}\`) have recorded **${nextStrikes}/5** violent chat strikes. If you send **more than 5** violent messages, GOT Agent will **automatically block your IP address** and revoke your access.`,
+              highlights: [
+                `Safety Strike: ${nextStrikes}/5`,
+                `IP Monitored: ${clientIp}`,
+                'GOT Agent Security Guard',
+              ],
+            };
+          }
+        } else {
+          data = await runStaticHostClientChat({
+            message: effectiveText,
+            agentMode,
+            useGoogleSearch,
+            imageBase64: base64Data,
+            imageMimeType: currentImgMime,
+            pastSessionsSummary,
+            currentUser,
+            history: updatedHistory.slice(-10).map((m) => ({
+              role: m.role,
+              text: m.text,
+            })),
+          });
+        }
       }
 
       clearTimeout(timeoutId);
+
+      if (typeof data?.violentStrikeCount === 'number' && currentUser) {
+        setCurrentUser((prev) =>
+          prev
+            ? { ...prev, violentChatCount: data.violentStrikeCount }
+            : prev
+        );
+      }
 
       if (data?.blocked) {
         setIsIpBlocked(true);
@@ -5679,7 +5699,13 @@ export default function App() {
         return;
       }
 
-      const replyText = data.reply || 'Here is your response from GOT Agent.';
+      if (data?.createdProject) {
+        handleAddProjectToWorkspace(data.createdProject);
+      }
+
+      const rawReplyText =
+        data.reply || 'Here is your response from GOT Agent.';
+      const replyText = sanitizeClientAiReply(rawReplyText);
 
       // Deterministically deduct tokens unless already depleted
       const tokenResult = data?.tokenDepleted
@@ -5740,21 +5766,6 @@ export default function App() {
         )
       );
 
-      // Sync chat session to Firebase if authenticated with Firebase Auth
-      if (auth.currentUser && currentUser) {
-        syncChatSessionToFirebase({
-          uid: auth.currentUser.uid,
-          userName: currentUser.name,
-          sessionId: targetSessionId,
-          title: nextTitle,
-          messagesSummary: [...updatedHistory, agentMsg]
-            .slice(-10)
-            .map((m) => `[${m.role}]: ${m.text.slice(0, 300)}`)
-            .join('\n'),
-          messageCount: updatedHistory.length + 1,
-        }).catch(() => {});
-      }
-
       if (realtimeVoiceActiveRef.current || fromVoiceConversation) {
         setVoiceState('speaking');
         setVoiceStatusLabel('GOT Agent is speaking reply...');
@@ -5769,7 +5780,7 @@ export default function App() {
       }
     } catch {
       clearTimeout(timeoutId);
-      const fbText = `### ${effectiveText}\n\nI am **GOT Agent** (created by **Abhinav**, running on **${agentMode}**). Your conversation history is saved permanently in local storage and Firebase. Tap **Regenerate** or ask a follow-up question below!`;
+      const fbText = `### ${effectiveText}\n\nI am **GOT Agent** (founded & created by **Abhinav** · Contact: \`abhinavmail908@gmail.com\` · Instagram: \`@abhinav_official_l\`, running on **${agentMode}**). Your conversation history is saved in your local memory. Tap **Regenerate** or ask a follow-up question below!`;
       const tokenResult = applyDeterministicTokenDeduction(fbText);
       const fallbackMsg: GotChatMessage = {
         id: `agent-${Date.now()}`,
@@ -5924,24 +5935,24 @@ export default function App() {
     );
   }
 
-  // Render Public Website User Portal Gate (Name + Email + Password + 6-Digit Email OTP + Firebase Google Sign-In) when user opens Chat Portal or Account Switcher
+  // Render Public Website Instant Name Entry & Free Credit Claim Modal (No Login or Signup Password Needed!)
   if ((!currentUser && activeWebsiteTab === 'chat') || showSwitchAccountModal) {
     return (
       <div className="min-h-[100dvh] flex flex-col items-center justify-center p-4 text-stone-900 relative overflow-hidden">
         <motion.div
           initial={{ opacity: 0, y: 14 }}
           animate={{ opacity: 1, y: 0 }}
-          className="w-full max-w-md liquid-glass rounded-[32px] p-6 sm:p-8 space-y-4 shadow-2xl border border-white/90 relative z-10 max-h-[94dvh] overflow-y-auto"
+          className="w-full max-w-md liquid-glass rounded-[32px] p-6 sm:p-8 space-y-5 shadow-2xl border border-white/90 relative z-10 max-h-[94dvh] overflow-y-auto"
         >
           <div className="flex items-center justify-between gap-3">
             <div className="flex items-center gap-3">
               <GotBubbleLogo size="md" />
               <div>
                 <h1 className="text-lg sm:text-xl font-bold font-display text-stone-900">
-                  GOT Agent · User Portal
+                  Welcome to GOT Agent
                 </h1>
                 <p className="text-xs text-stone-500">
-                  Created by Abhinav · Firebase Cloud + Email OTP
+                  Founded by Abhinav · Enter Your Name &amp; Claim Free AI Credits
                 </p>
               </div>
             </div>
@@ -5958,172 +5969,35 @@ export default function App() {
             </button>
           </div>
 
-          {/* 1-Click Firebase Google Verification Login */}
-          <button
-            type="button"
-            onClick={handleGoogleFirebaseLogin}
-            disabled={isAuthSubmitting}
-            className="w-full min-h-[44px] px-4 py-2.5 rounded-2xl bg-white border border-stone-300 text-stone-900 text-xs sm:text-sm font-bold flex items-center justify-center gap-2 shadow-sm hover:bg-stone-50 transition-all"
-          >
-            <Globe className="w-4 h-4 text-emerald-600" />
-            <span>Continue with Google (Firebase Cloud Verified)</span>
-          </button>
-
-          <div className="flex items-center gap-2 text-[11px] text-stone-400 font-mono uppercase">
-            <div className="flex-1 h-px bg-stone-300/70" />
-            <span>OR EMAIL + OTP PORTAL</span>
-            <div className="flex-1 h-px bg-stone-300/70" />
+          <div className="p-3.5 rounded-2xl liquid-glass-subtle border border-amber-500/30 flex items-center justify-between gap-3">
+            <div className="space-y-0.5">
+              <div className="text-xs font-bold text-stone-900 flex items-center gap-1.5">
+                <Zap className="w-4 h-4 text-amber-500" />
+                <span>
+                  Instant Free Credit Grant:{' '}
+                  {(publicConfig.defaultUserTokens || 5000).toLocaleString()} Credits
+                </span>
+              </div>
+              <div className="text-[11px] text-stone-600">
+                No sign-up, email, or password required — just enter your name!
+              </div>
+            </div>
           </div>
 
-          {/* Mode Toggle: Create Account vs Log In by Name/Email */}
-          <div className="grid grid-cols-2 gap-2 p-1 rounded-2xl liquid-glass-subtle">
-            <button
-              type="button"
-              onClick={() => {
-                setAuthGateMode('register');
-                setAuthError('');
-              }}
-              className={`min-h-[38px] rounded-xl text-xs font-semibold transition-all ${
-                authGateMode === 'register'
-                  ? 'bg-stone-900 text-white shadow-sm'
-                  : 'text-stone-600 hover:text-stone-900'
-              }`}
-            >
-              Create Portal Account
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setAuthGateMode('login');
-                setAuthError('');
-              }}
-              className={`min-h-[38px] rounded-xl text-xs font-semibold transition-all ${
-                authGateMode === 'login'
-                  ? 'bg-stone-900 text-white shadow-sm'
-                  : 'text-stone-600 hover:text-stone-900'
-              }`}
-            >
-              Log In by Name / Email
-            </button>
-          </div>
-
-          <form onSubmit={handlePublicUserAuthSubmit} className="space-y-3">
-            <div className="space-y-1">
+          <form onSubmit={handlePublicUserAuthSubmit} className="space-y-4">
+            <div className="space-y-1.5">
               <label className="text-xs font-semibold text-stone-700 block">
-                Your Name {authGateMode === 'login' && '(or leave blank if using Email)'}
+                Enter Your Name
               </label>
               <input
                 type="text"
-                required={authGateMode === 'register'}
+                required
+                autoFocus
                 value={authName}
                 onChange={(e) => setAuthName(e.target.value)}
-                placeholder="Enter your name (saved to AI Memory)"
-                className="w-full min-h-[42px] px-3.5 py-2 rounded-2xl liquid-glass-subtle text-sm text-stone-900 focus:outline-none border border-stone-300/80"
+                placeholder="Type your name (e.g. Rahul, Priya, Alex)..."
+                className="w-full min-h-[46px] px-4 py-2.5 rounded-2xl liquid-glass-subtle text-sm text-stone-900 focus:outline-none border border-stone-300/80"
               />
-            </div>
-
-            <div className="space-y-1">
-              <div className="flex items-center justify-between gap-2">
-                <label className="text-xs font-semibold text-stone-700 block">
-                  Your Email {authGateMode === 'login' && '(optional if logging in by Name)'}
-                </label>
-                <button
-                  type="button"
-                  onClick={handleSendEmailOtp}
-                  disabled={isSendingOtp}
-                  className="text-[11px] font-bold text-emerald-700 hover:text-emerald-900 underline"
-                >
-                  {isSendingOtp ? 'Sending OTP...' : 'Send 6-Digit Email OTP'}
-                </button>
-              </div>
-              <input
-                type="email"
-                required={authGateMode === 'register'}
-                value={authEmail}
-                onChange={(e) => setAuthEmail(e.target.value)}
-                placeholder="Enter your email address"
-                className="w-full min-h-[42px] px-3.5 py-2 rounded-2xl liquid-glass-subtle text-sm text-stone-900 focus:outline-none border border-stone-300/80"
-              />
-            </div>
-
-            {/* 6-Digit Email OTP Verification Box */}
-            <div className="p-3 rounded-2xl liquid-glass-subtle space-y-2 border border-stone-300/60">
-              <div className="flex items-center justify-between gap-2 text-xs">
-                <span className="font-semibold text-stone-800 flex items-center gap-1.5">
-                  <KeyRound className="w-3.5 h-3.5 text-amber-600" />
-                  <span>Email OTP Verification</span>
-                </span>
-                {emailOtpVerified ? (
-                  <span className="px-2 py-0.5 rounded-lg bg-emerald-500/15 text-emerald-800 font-bold text-[11px] flex items-center gap-1">
-                    <CheckCircle2 className="w-3 h-3" /> Verified
-                  </span>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={handleSendEmailOtp}
-                    disabled={isSendingOtp}
-                    className="px-2.5 py-1 rounded-xl bg-stone-900 text-white text-[11px] font-semibold"
-                  >
-                    {isSendingOtp ? 'Sending...' : 'Get 6-Digit OTP'}
-                  </button>
-                )}
-              </div>
-
-              {otpStatusMessage && (
-                <div className="p-2 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-[11px] text-emerald-900 font-mono">
-                  {otpStatusMessage}
-                </div>
-              )}
-
-              {!emailOtpVerified && (
-                <div className="flex items-center gap-2">
-                  <input
-                    type="text"
-                    maxLength={6}
-                    value={otpInputCode}
-                    onChange={(e) =>
-                      setOtpInputCode(e.target.value.replace(/\D/g, ''))
-                    }
-                    placeholder="Enter 6-digit OTP"
-                    className="flex-1 min-h-[38px] px-3 rounded-xl bg-white/90 text-xs font-mono tracking-widest border border-stone-300/80"
-                  />
-                  <button
-                    type="button"
-                    onClick={handleVerifyEmailOtp}
-                    disabled={isVerifyingOtp}
-                    className="min-h-[38px] px-3.5 rounded-xl bg-emerald-700 text-white text-xs font-semibold"
-                  >
-                    {isVerifyingOtp ? 'Checking...' : 'Verify OTP'}
-                  </button>
-                </div>
-              )}
-            </div>
-
-            <div className="space-y-1">
-              <label className="text-xs font-semibold text-stone-700 block">
-                Password
-              </label>
-              <div className="relative flex items-center">
-                <input
-                  type={showAuthPassword ? 'text' : 'password'}
-                  required
-                  value={authPassword}
-                  onChange={(e) => setAuthPassword(e.target.value)}
-                  placeholder="Enter your password"
-                  className="w-full min-h-[42px] pl-3.5 pr-10 py-2 rounded-2xl liquid-glass-subtle text-sm text-stone-900 focus:outline-none border border-stone-300/80"
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowAuthPassword((p) => !p)}
-                  className="absolute right-3 text-stone-500 hover:text-stone-800"
-                >
-                  {showAuthPassword ? (
-                    <EyeOff className="w-4 h-4" />
-                  ) : (
-                    <Eye className="w-4 h-4" />
-                  )}
-                </button>
-              </div>
             </div>
 
             {authError && (
@@ -6136,18 +6010,37 @@ export default function App() {
             <button
               type="submit"
               disabled={isAuthSubmitting}
-              className="w-full min-h-[46px] rounded-2xl bg-stone-900 text-white text-sm font-semibold liquid-glass-hover flex items-center justify-center gap-2"
+              className="w-full min-h-[48px] rounded-2xl bg-stone-900 text-white text-sm font-bold liquid-glass-hover flex items-center justify-center gap-2 shadow-lg"
             >
               <Sparkles className="w-4 h-4 text-amber-400" />
               <span>
                 {isAuthSubmitting
-                  ? 'Opening Your Portal...'
-                  : authGateMode === 'register'
-                    ? 'Save to Firebase & Open My Portal'
-                    : 'Unlock My Portal & Bind IP'}
+                  ? 'Crediting Your Account...'
+                  : `Enter & Claim ${(publicConfig.defaultUserTokens || 5000).toLocaleString()} Free Credits`}
               </span>
             </button>
           </form>
+
+          <div className="pt-2 border-t border-stone-200/80 text-center text-[11px] text-stone-500 space-y-1">
+            <div>
+              Founder: <strong className="text-stone-800">Abhinav</strong> ·{' '}
+              <a
+                href="mailto:abhinavmail908@gmail.com"
+                className="underline font-mono text-stone-700"
+              >
+                abhinavmail908@gmail.com
+              </a>{' '}
+              ·{' '}
+              <a
+                href="https://www.instagram.com/abhinav_official_l/"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline font-mono text-pink-600"
+              >
+                @abhinav_official_l
+              </a>
+            </div>
+          </div>
         </motion.div>
       </div>
     );
@@ -6284,6 +6177,17 @@ export default function App() {
             }`}
           >
             AI Chat
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveWebsiteTab('founder')}
+            className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
+              activeWebsiteTab === 'founder'
+                ? 'border-stone-900 dark:border-stone-100 text-stone-900 dark:text-white font-semibold'
+                : 'border-transparent hover:text-stone-900 dark:hover:text-stone-200'
+            }`}
+          >
+            Founder &amp; Contact
           </button>
           <button
             type="button"
@@ -6548,45 +6452,57 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="pt-4 border-t border-stone-200/70 dark:border-stone-800 flex items-center justify-between">
-                <div className="flex items-center gap-2.5">
-                  <div className="w-8 h-8 rounded-full overflow-hidden bg-stone-200 shrink-0">
-                    {!avatarBroken && (
-                      <img
-                        src={OPERATOR_AVATAR_URL}
-                        alt="Creator Abhinav"
-                        referrerPolicy="no-referrer"
-                        onError={() => setAvatarBroken(true)}
-                        className="w-full h-full object-cover"
-                      />
-                    )}
-                  </div>
-                  <div className="text-xs">
-                    <div className="font-semibold">Creator: Abhinav</div>
-                    <div className="text-[10px] text-stone-500">
-                      GOT Agent · GOT LOCAL
+              <div className="pt-4 border-t border-stone-200/70 dark:border-stone-800 space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2.5">
+                    {/* Blank Founder Profile Frame (No Photo Inside) */}
+                    <div
+                      aria-label="Founder Profile Blank Frame"
+                      className="w-8 h-8 rounded-full border border-stone-300 dark:border-stone-700 bg-white/80 dark:bg-stone-900 shrink-0"
+                    />
+                    <div className="text-xs">
+                      <div className="font-semibold">Founder: Abhinav</div>
+                      <div className="text-[10px] text-stone-500 font-mono">
+                        abhinavmail908@gmail.com
+                      </div>
                     </div>
                   </div>
+                  <button
+                    type="button"
+                    onClick={() => setIsDark((prev) => !prev)}
+                    aria-label="Switch theme"
+                    className="min-h-[40px] min-w-[40px] rounded-xl liquid-glass-subtle flex items-center justify-center"
+                  >
+                    {isDark ? (
+                      <Sun className="w-4 h-4 text-amber-400" />
+                    ) : (
+                      <Moon className="w-4 h-4 text-stone-700" />
+                    )}
+                  </button>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setIsDark((prev) => !prev)}
-                  aria-label="Switch theme"
-                  className="min-h-[40px] min-w-[40px] rounded-xl liquid-glass-subtle flex items-center justify-center"
-                >
-                  {isDark ? (
-                    <Sun className="w-4 h-4 text-amber-400" />
-                  ) : (
-                    <Moon className="w-4 h-4 text-stone-700" />
-                  )}
-                </button>
+                <div className="flex items-center justify-between gap-2 text-[11px] font-semibold">
+                  <a
+                    href="mailto:abhinavmail908@gmail.com"
+                    className="px-2.5 py-1 rounded-xl liquid-glass-subtle text-stone-800 dark:text-stone-200 truncate"
+                  >
+                    ✉️ Email Abhinav
+                  </a>
+                  <a
+                    href="https://www.instagram.com/abhinav_official_l/"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="px-2.5 py-1 rounded-xl liquid-glass-subtle text-pink-600 dark:text-pink-400 truncate"
+                  >
+                    📸 @abhinav_official_l
+                  </a>
+                </div>
               </div>
             </motion.aside>
           </motion.div>
         )}
       </AnimatePresence>
 
-      {/* Main Device-Adaptive Workspace or Official Website Sections (Home, Features, Privacy, Terms) */}
+      {/* Main Device-Adaptive Workspace or Official Website Sections (Home, Founder, Features, Privacy, Terms) */}
       {activeWebsiteTab !== 'chat' ? (
         <main className="relative z-20 flex-1 flex flex-col">
           <OfficialWebsiteSections
@@ -6601,7 +6517,6 @@ export default function App() {
               }
             }}
             currentUser={currentUser}
-            firebaseConnected={firebaseConnected}
             defaultUserTokens={publicConfig.defaultUserTokens || 5000}
           />
         </main>
@@ -6627,11 +6542,20 @@ export default function App() {
               aria-label="Select GOT Agent model version"
               className="min-h-[38px] px-1.5 py-1 rounded-xl bg-transparent text-xs font-semibold text-stone-800 dark:text-stone-100 focus:outline-none truncate"
             >
-              <option value="GOT LOCAL">GOT LOCAL</option>
+              <option value="GOT LOCAL">GOT LOCAL (Claude Part-Wise)</option>
+              <option value="HTML Video Studio">
+                GOT Agent · 2D HTML5 Video Studio
+              </option>
+              <option value="2D Graph & Graphic Studio">
+                GOT Agent · 2D Graph &amp; Graphic Studio
+              </option>
+              <option value="Large Project Studio">
+                GOT Agent · Large Project Studio
+              </option>
               <option value="Deep Reasoning">GOT Agent · Deep Reasoning</option>
               <option value="Code Studio">GOT Agent · Code Studio</option>
               <option value="Vision & Image OCR">
-                GOT Agent · Vision & Image OCR
+                GOT Agent · Vision &amp; Image OCR
               </option>
               <option value="Google Search Research">
                 GOT Agent · Google Search Research
@@ -6645,6 +6569,15 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-1.5 shrink-0">
+            <button
+              type="button"
+              onClick={() => setShowProjectsModal(true)}
+              title="Open AI Projects Workspace (+ Add Project)"
+              className={`min-h-[38px] px-2.5 sm:px-3 py-1.5 rounded-xl bg-stone-900 text-stone-50 dark:bg-stone-100 dark:text-stone-950 text-xs font-semibold ${festivalHoverClass} flex items-center gap-1`}
+            >
+              <Plus className="w-3.5 h-3.5 text-amber-400" />
+              <span>Add Project ({savedProjects.length})</span>
+            </button>
             <button
               type="button"
               onClick={() => setDevicePanelOpen((prev) => !prev)}
@@ -7423,7 +7356,7 @@ export default function App() {
                   </button>
                 </form>
 
-                {/* Live User Token Balance & Firebase Cloud Status Strip */}
+                {/* Live User Credit Balance & + Add Project Strip (No Founder Info Below Input Text Box) */}
                 {currentUser && (
                   <div className="px-2.5 pt-1 flex items-center justify-between gap-2 text-[11px] font-mono text-stone-500 dark:text-stone-400 flex-wrap">
                     <div className="flex items-center gap-2">
@@ -7439,20 +7372,44 @@ export default function App() {
                       >
                         <Zap className="w-3 h-3" />
                         {currentUser.unlimitedTokens || currentUser.role === 'co-admin'
-                          ? '∞ Unlimited Tokens'
-                          : `${(currentUser.tokenBalance ?? 0).toLocaleString()} Tokens Remaining`}
+                          ? '∞ Unlimited Credits'
+                          : `${(currentUser.tokenBalance ?? 0).toLocaleString()} Credits Remaining`}
                       </span>
                       <span>
                         Used: {(currentUser.totalTokensUsed ?? 0).toLocaleString()}
                       </span>
                     </div>
-                    <div className="flex items-center gap-2">
-                      {currentUser.emailVerified && (
-                        <span className="text-emerald-600 dark:text-emerald-400 font-semibold">
-                          ✓ OTP Verified
-                        </span>
-                      )}
-                      <span>☁️ Firebase Synced</span>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          handleSendMessage(
+                            'Create a custom 2D HTML5 Canvas animated explainer video with voiceover and chapters'
+                          )
+                        }
+                        className="px-2 py-0.5 rounded-lg liquid-glass-subtle text-stone-700 dark:text-stone-200 font-sans font-semibold"
+                      >
+                        2D Video
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          handleSendMessage(
+                            'Create an interactive 2D Bar Graph, Line Curve, Donut Chart, and 2D Vector Diagram'
+                          )
+                        }
+                        className="px-2 py-0.5 rounded-lg liquid-glass-subtle text-stone-700 dark:text-stone-200 font-sans font-semibold"
+                      >
+                        2D Graph
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setShowProjectsModal(true)}
+                        className="px-2 py-0.5 rounded-lg bg-stone-900 text-white dark:bg-stone-100 dark:text-stone-950 font-sans font-semibold flex items-center gap-1"
+                      >
+                        <Plus className="w-3 h-3" />
+                        <span>Add Project</span>
+                      </button>
                     </div>
                   </div>
                 )}
@@ -7462,6 +7419,198 @@ export default function App() {
         )}
       </main>
       )}
+
+      {/* AI Projects Workspace Modal (+ Add Project) */}
+      <AnimatePresence>
+        {showProjectsModal && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 bg-stone-950/60 backdrop-blur-md flex items-center justify-center p-3 sm:p-6"
+            onClick={() => setShowProjectsModal(false)}
+          >
+            <motion.div
+              initial={{ scale: 0.96, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.96, opacity: 0 }}
+              onClick={(e) => e.stopPropagation()}
+              className="w-full max-w-4xl max-h-[90vh] overflow-y-auto liquid-glass rounded-[32px] p-5 sm:p-7 border border-white/85 dark:border-stone-800 shadow-2xl space-y-5"
+            >
+              <div className="flex items-center justify-between gap-3 border-b border-stone-200/80 dark:border-stone-800 pb-4">
+                <div>
+                  <span className="text-[11px] font-mono uppercase tracking-widest text-amber-700 dark:text-amber-300 font-semibold">
+                    GOT AGENT · LARGE PROJECT STUDIO
+                  </span>
+                  <h2 className="text-xl sm:text-2xl font-bold font-display text-stone-900 dark:text-stone-100">
+                    AI Projects Workspace (+ Add Project)
+                  </h2>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowProjectsModal(false)}
+                  className="min-h-[40px] min-w-[40px] rounded-2xl liquid-glass-subtle flex items-center justify-center"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {/* Create & Add New AI Project Form */}
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  const titleText = newProjectTitle.trim() || 'Full-Stack Analytics & Automation App';
+                  const descText = newProjectDesc.trim();
+                  const fullSpec = descText
+                    ? `${titleText} — ${descText}`
+                    : titleText;
+                  const built = buildLargeProjectPackage(fullSpec, agentMode);
+                  handleAddProjectToWorkspace(built.project);
+                  setNewProjectTitle('');
+                  setNewProjectDesc('');
+                }}
+                className="p-4 rounded-2xl liquid-glass-subtle space-y-3"
+              >
+                <div className="text-xs font-bold uppercase tracking-wider text-stone-700 dark:text-stone-300">
+                  + Add New Large Project (AI Multi-File Generator)
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  <input
+                    type="text"
+                    value={newProjectTitle}
+                    onChange={(e) => setNewProjectTitle(e.target.value)}
+                    placeholder="Project Title (e.g. AI Finance Dashboard, CRM, 2D Game...)"
+                    className="min-h-[42px] px-3.5 py-2 rounded-xl bg-white/85 dark:bg-stone-900 border border-stone-300/80 dark:border-stone-700 text-xs sm:text-sm"
+                  />
+                  <input
+                    type="text"
+                    value={newProjectDesc}
+                    onChange={(e) => setNewProjectDesc(e.target.value)}
+                    placeholder="Features / Stack (e.g. Live 2D Graphs, Kanban, REST API...)"
+                    className="min-h-[42px] px-3.5 py-2 rounded-xl bg-white/85 dark:bg-stone-900 border border-stone-300/80 dark:border-stone-700 text-xs sm:text-sm"
+                  />
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="submit"
+                    className="min-h-[40px] px-4 py-2 rounded-xl bg-stone-900 text-white dark:bg-stone-100 dark:text-stone-950 text-xs font-bold flex items-center gap-1.5"
+                  >
+                    <Plus className="w-3.5 h-3.5 text-amber-400" />
+                    <span>Generate &amp; Add Project Instantly</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const promptToUse =
+                        newProjectTitle.trim() ||
+                        'Build a complete large multi-file project with interactive dashboard and 2D analytics';
+                      setShowProjectsModal(false);
+                      handleSendMessage(
+                        `Add project and build complete large project: ${promptToUse}`
+                      );
+                    }}
+                    className="min-h-[40px] px-4 py-2 rounded-xl liquid-glass text-xs font-semibold text-stone-800 dark:text-stone-200 flex items-center gap-1.5"
+                  >
+                    <Sparkles className="w-3.5 h-3.5 text-amber-600" />
+                    <span>Ask AI in Chat (Claude Part-Wise)</span>
+                  </button>
+                </div>
+              </form>
+
+              {/* Saved Projects List & Live Preview */}
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+                <div className="lg:col-span-5 space-y-2.5 max-h-[380px] overflow-y-auto pr-1">
+                  <div className="text-xs font-semibold text-stone-500">
+                    Saved Projects in Workspace ({savedProjects.length})
+                  </div>
+                  {savedProjects.map((proj) => {
+                    const isSelected =
+                      (activePreviewProject?.id || savedProjects[0]?.id) ===
+                      proj.id;
+                    return (
+                      <div
+                        key={proj.id}
+                        onClick={() => setActivePreviewProject(proj)}
+                        className={`p-3.5 rounded-2xl cursor-pointer transition-all space-y-1.5 ${
+                          isSelected
+                            ? 'bg-stone-900 text-white dark:bg-stone-100 dark:text-stone-950 shadow-md'
+                            : 'liquid-glass-subtle text-stone-800 dark:text-stone-200'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-xs font-bold truncate">
+                            {proj.title}
+                          </span>
+                          <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-amber-500/20 text-amber-400 shrink-0">
+                            {proj.files.length} files
+                          </span>
+                        </div>
+                        <p className="text-[11px] opacity-80 line-clamp-2">
+                          {proj.description}
+                        </p>
+                        <div className="flex items-center justify-between text-[10px] font-mono opacity-70 pt-1">
+                          <span>{proj.category}</span>
+                          <span>{proj.createdAt}</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <div className="lg:col-span-7 space-y-3">
+                  {(() => {
+                    const currentProj =
+                      activePreviewProject || savedProjects[0] || null;
+                    if (!currentProj) return null;
+                    const htmlFile = currentProj.files.find((f) =>
+                      f.name.endsWith('.html')
+                    );
+                    return (
+                      <div className="p-4 rounded-2xl liquid-glass-subtle space-y-3">
+                        <div className="flex items-center justify-between gap-2 flex-wrap">
+                          <div>
+                            <h3 className="text-sm font-bold text-stone-900 dark:text-stone-100">
+                              {currentProj.title}
+                            </h3>
+                            <div className="text-[11px] font-mono text-stone-500">
+                              Files:{' '}
+                              {currentProj.files
+                                .map((f) => f.name)
+                                .join(' · ')}
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setShowProjectsModal(false);
+                              handleSendMessage(
+                                `Expand project "${currentProj.title}" part-wise with additional modules and 2D graphs`
+                              );
+                            }}
+                            className="px-3 py-1.5 rounded-xl bg-stone-900 text-white dark:bg-stone-100 dark:text-stone-950 text-xs font-semibold"
+                          >
+                            Open in AI Chat →
+                          </button>
+                        </div>
+                        {htmlFile && (
+                          <div className="rounded-xl overflow-hidden border border-stone-300 dark:border-stone-800 bg-stone-950 h-[280px]">
+                            <iframe
+                              title={currentProj.title}
+                              srcDoc={htmlFile.content}
+                              sandbox="allow-scripts"
+                              className="w-full h-full border-0"
+                            />
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
+                </div>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
