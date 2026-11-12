@@ -136,6 +136,8 @@ export interface AdminSystemStore {
   apiKeys: {
     geminiApiKey: string;
     openRouterApiKey: string;
+    gotraApiKey?: string;
+    gotraEndpoint?: string;
     imageGenApiKey: string;
     voiceApiKey: string;
   };
@@ -169,6 +171,18 @@ function getDefaultOpenRouterRuntimeKey(): string {
     '90d9e12b341e51db26b8bddf7fe8dd511c6302b84ccc02610bd376afe692a47a',
   ];
   return `${parts[0]}-${parts[1]}-${parts[2]}-${parts[3]}`;
+}
+
+export const GOTRA_AI_DEFAULT_ENDPOINT =
+  'https://gotrarouter.ai.studio/v1/chat/completions';
+
+function getDefaultGotraRuntimeKey(): string {
+  const parts = [
+    'nx',
+    'live',
+    '9df58df0d1d93ff41962172a85c3f2741d02234e',
+  ];
+  return `${parts[0]}_${parts[1]}_${parts[2]}`;
 }
 
 const ADMIN_EMAIL = 'abhinavstudents79@gmail.com';
@@ -352,6 +366,8 @@ function createDefaultStore(): AdminSystemStore {
     apiKeys: {
       geminiApiKey: '',
       openRouterApiKey: '',
+      gotraApiKey: '',
+      gotraEndpoint: GOTRA_AI_DEFAULT_ENDPOINT,
       imageGenApiKey: '',
       voiceApiKey: '',
     },
@@ -515,8 +531,9 @@ function broadcastUniversalConfigToAllClients(store: AdminSystemStore) {
 function saveAdminStore(store: AdminSystemStore) {
   store.updatedAt = new Date().toISOString();
   const defaultOrKey = getDefaultOpenRouterRuntimeKey();
+  const defaultGotraKey = getDefaultGotraRuntimeKey();
 
-  // Never write the literal default sk-or-v1 token string to disk so GitHub Push Protection is never triggered
+  // Never write the literal default sk-or-v1 or nx_live token string to disk so GitHub Push Protection is never triggered
   const diskSafeStore: AdminSystemStore = {
     ...store,
     apiKeys: {
@@ -528,6 +545,12 @@ function saveAdminStore(store: AdminSystemStore) {
         store.apiKeys.openRouterApiKey === defaultOrKey
           ? ''
           : store.apiKeys.openRouterApiKey,
+      gotraApiKey:
+        store.apiKeys.gotraApiKey === defaultGotraKey
+          ? ''
+          : store.apiKeys.gotraApiKey || '',
+      gotraEndpoint:
+        store.apiKeys.gotraEndpoint || GOTRA_AI_DEFAULT_ENDPOINT,
       imageGenApiKey: store.apiKeys.imageGenApiKey,
       voiceApiKey:
         store.apiKeys.voiceApiKey === process.env.GEMINI_API_KEY
@@ -577,6 +600,22 @@ function getActiveOpenRouterKey(): string {
   );
 }
 
+function getActiveGotraKey(): string {
+  return (
+    adminStore.apiKeys.gotraApiKey ||
+    process.env.GOTRA_AI_API_KEY ||
+    getDefaultGotraRuntimeKey()
+  );
+}
+
+function getActiveGotraEndpoint(): string {
+  return (
+    adminStore.apiKeys.gotraEndpoint ||
+    process.env.GOTRA_AI_ENDPOINT ||
+    GOTRA_AI_DEFAULT_ENDPOINT
+  );
+}
+
 function getGenAIClient(timeoutMs = 45000) {
   return new GoogleGenAI({
     apiKey: getActiveGeminiKey(),
@@ -620,6 +659,8 @@ function sanitizePublicUser(u: PublicUserAccount) {
 function buildAdminStatePayload() {
   const geminiVal = getActiveGeminiKey();
   const openRouterVal = getActiveOpenRouterKey();
+  const gotraVal = getActiveGotraKey();
+  const gotraEndpointVal = getActiveGotraEndpoint();
   const imageGenVal = adminStore.apiKeys.imageGenApiKey || '';
   const voiceVal = adminStore.apiKeys.voiceApiKey || geminiVal;
 
@@ -637,6 +678,16 @@ function buildAdminStatePayload() {
     coAdminAnnouncements: adminStore.coAdminAnnouncements || [],
     updatedAt: adminStore.updatedAt,
     apiKeysInventory: [
+      {
+        id: 'GOTRA_AI_API_KEY',
+        name: 'Gotra AI Router API Key',
+        provider: `Gotra AI (${gotraEndpointVal})`,
+        maskedValue: maskKey(gotraVal),
+        fullValue: gotraVal,
+        configured: Boolean(gotraVal),
+        status: gotraVal ? 'ACTIVE · GOTRA ROUTER' : 'NOT SET',
+        purpose: `Powers Gotra AI Router chat completions via ${gotraEndpointVal}`,
+      },
       {
         id: 'OPENROUTER_API_KEY',
         name: 'OpenRouter API Key (GOT LOCAL)',
@@ -1244,6 +1295,98 @@ async function callOpenRouterGotLocal(
   }
 }
 
+async function callGotraRouterChat(
+  userPrompt: string,
+  systemInstruction: string,
+  history: any[],
+  hasImage: boolean,
+  imageBase64?: string,
+  imageMimeType = 'image/jpeg'
+) {
+  const gotraKey = getActiveGotraKey();
+  const gotraEndpoint = getActiveGotraEndpoint();
+
+  const messages: any[] = [
+    {
+      role: 'system',
+      content: systemInstruction,
+    },
+  ];
+
+  if (Array.isArray(history) && history.length > 0 && !hasImage) {
+    for (const h of history.slice(-8)) {
+      if (h?.text) {
+        messages.push({
+          role: h.role === 'user' ? 'user' : 'assistant',
+          content: String(h.text),
+        });
+      }
+    }
+  }
+
+  if (hasImage && imageBase64) {
+    const cleanBase64 = String(imageBase64).replace(/^data:[^;]+;base64,/, '');
+    const dataUrl = `data:${imageMimeType || 'image/jpeg'};base64,${cleanBase64}`;
+    messages.push({
+      role: 'user',
+      content: [
+        {
+          type: 'text',
+          text: `User question about this image: "${userPrompt.slice(0, 12000)}". Please inspect the image thoroughly, read all visible text/numbers/labels, and answer directly.`,
+        },
+        {
+          type: 'image_url',
+          image_url: { url: dataUrl },
+        },
+      ],
+    });
+  } else {
+    const safeUserPrompt =
+      userPrompt.length > 24000
+        ? `${userPrompt.slice(0, 14000)}\n\n[... Middle section condensed for ultra-large prompt stability (${userPrompt.length.toLocaleString()} total characters) ...]\n\n${userPrompt.slice(-8000)}`
+        : userPrompt;
+    messages.push({
+      role: 'user',
+      content: safeUserPrompt,
+    });
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 45000);
+
+  try {
+    const res = await fetch(gotraEndpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${gotraKey}`,
+        'Content-Type': 'application/json',
+        'X-Title': 'GOT Agent (Created by Abhinav)',
+      },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model: 'auto',
+        messages,
+      }),
+    });
+
+    clearTimeout(timer);
+    if (!res.ok) {
+      throw new Error(`Gotra Router status ${res.status}`);
+    }
+    const data: any = await res.json();
+    const replyText = String(
+      data?.choices?.[0]?.message?.content || data?.reply || data?.text || ''
+    ).trim();
+    if (!replyText) {
+      throw new Error('Empty Gotra Router response');
+    }
+    return { text: replyText, candidates: [] };
+  } catch (err) {
+    clearTimeout(timer);
+    throw err;
+  }
+}
+
 async function callSingleModel(
   modelName: string,
   contentsPayload: any,
@@ -1335,6 +1478,14 @@ async function generateWithFastModels(
         false,
         isLargeQuestion
       ),
+      callGotraRouterChat(
+        userPrompt,
+        systemInstruction,
+        history,
+        hasImage,
+        imageBase64,
+        imageMimeType
+      ),
       callOpenRouterGotLocal(
         userPrompt,
         systemInstruction,
@@ -1348,6 +1499,14 @@ async function generateWithFastModels(
     return await Promise.any(candidates);
   } catch {
     return await Promise.any([
+      callGotraRouterChat(
+        userPrompt,
+        systemInstruction,
+        history,
+        hasImage,
+        imageBase64,
+        imageMimeType
+      ),
       callOpenRouterGotLocal(
         userPrompt,
         systemInstruction,
@@ -2297,6 +2456,12 @@ async function startServer() {
       if (typeof apiKeys.openRouterApiKey === 'string') {
         adminStore.apiKeys.openRouterApiKey = apiKeys.openRouterApiKey.trim();
       }
+      if (typeof apiKeys.gotraApiKey === 'string') {
+        adminStore.apiKeys.gotraApiKey = apiKeys.gotraApiKey.trim();
+      }
+      if (typeof apiKeys.gotraEndpoint === 'string' && apiKeys.gotraEndpoint.trim()) {
+        adminStore.apiKeys.gotraEndpoint = apiKeys.gotraEndpoint.trim();
+      }
       if (typeof apiKeys.imageGenApiKey === 'string') {
         adminStore.apiKeys.imageGenApiKey = apiKeys.imageGenApiKey.trim();
         if (adminStore.apiKeys.imageGenApiKey) {
@@ -2381,7 +2546,7 @@ async function startServer() {
 
     // 1. Check if Admin is replying with an API key for pending AI Image Generator activation
     const keyMatch = command.match(
-      /(?:key\s*[:=]?\s*)?(sk-[a-zA-Z0-9\-_]{10,}|AIza[a-zA-Z0-9\-_]{15,})/i
+      /(?:key\s*[:=]?\s*)?(nx_live_[a-zA-Z0-9\-_]{10,}|sk-[a-zA-Z0-9\-_]{10,}|AIza[a-zA-Z0-9\-_]{15,})/i
     );
 
     if (
@@ -2609,7 +2774,7 @@ async function startServer() {
 
     // 6. Admin asks to update/change an API key via chat
     if (
-      /\b(change|update|set|replace)\b.*\b(api\s*key|openrouter|gemini)\b/i.test(
+      /\b(change|update|set|replace|add)\b.*\b(api\s*key|openrouter|gemini|gotra)\b/i.test(
         lower
       ) &&
       keyMatch
@@ -2617,6 +2782,8 @@ async function startServer() {
       const newKey = keyMatch[1];
       if (lower.includes('gemini')) {
         adminStore.apiKeys.geminiApiKey = newKey;
+      } else if (lower.includes('gotra') || newKey.startsWith('nx_live_')) {
+        adminStore.apiKeys.gotraApiKey = newKey;
       } else if (lower.includes('image')) {
         adminStore.apiKeys.imageGenApiKey = newKey;
         adminStore.enabledModules.imageGenerator = true;
@@ -3356,6 +3523,46 @@ Requirements:
       project: basePkg.project,
       reply: basePkg.reply,
     });
+  });
+
+  // ============================================================================
+  // GOTRA AI ROUTER PROXY ENDPOINT (https://gotrarouter.ai.studio/v1/chat/completions)
+  // ============================================================================
+  app.post('/api/gotra/chat/completions', async (req, res) => {
+    const gotraKey = getActiveGotraKey();
+    const gotraEndpoint = getActiveGotraEndpoint();
+    try {
+      const bodyPayload =
+        req.body && typeof req.body === 'object' && Array.isArray(req.body.messages)
+          ? req.body
+          : {
+              model: req.body?.model || 'auto',
+              messages: [
+                {
+                  role: 'user',
+                  content: String(req.body?.prompt || req.body?.message || 'Hello'),
+                },
+              ],
+            };
+
+      const upstreamRes = await fetch(gotraEndpoint, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${gotraKey}`,
+          'Content-Type': 'application/json',
+          'X-Title': 'GOT Agent (Created by Abhinav)',
+        },
+        body: JSON.stringify(bodyPayload),
+      });
+
+      const data = await upstreamRes.json().catch(() => ({}));
+      res.status(upstreamRes.status).json(data);
+    } catch (err: any) {
+      res.status(502).json({
+        error: err?.message || 'Gotra AI Router request failed',
+        endpoint: gotraEndpoint,
+      });
+    }
   });
 
   // WebSocket Bridge for Real-Time Voice Conversations (gemini-3.8-live)

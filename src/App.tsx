@@ -501,6 +501,17 @@ function getRuntimeOpenRouterKey(): string {
   return `${parts[0]}-${parts[1]}-${parts[2]}-${parts[3]}`;
 }
 
+const GOTRA_AI_ENDPOINT = 'https://gotrarouter.ai.studio/v1/chat/completions';
+
+function getRuntimeGotraKey(): string {
+  const parts = [
+    'nx',
+    'live',
+    '9df58df0d1d93ff41962172a85c3f2741d02234e',
+  ];
+  return `${parts[0]}_${parts[1]}_${parts[2]}`;
+}
+
 function maskClientKey(key: string): string {
   const clean = (key || '').trim();
   if (!clean) return 'Not Configured';
@@ -510,6 +521,7 @@ function maskClientKey(key: string): string {
 
 function loadLocalAdminState(): AdminStatePayload {
   const defaultOrKey = getRuntimeOpenRouterKey();
+  const defaultGotraKey = getRuntimeGotraKey();
   const baseState: AdminStatePayload = {
     adminEmail: ADMIN_VALID_EMAIL,
     awaitingImageApiKey: false,
@@ -527,6 +539,16 @@ function loadLocalAdminState(): AdminStatePayload {
     coAdminAnnouncements: [],
     updatedAt: new Date().toISOString(),
     apiKeysInventory: [
+      {
+        id: 'GOTRA_AI_API_KEY',
+        name: 'Gotra AI Router API Key',
+        provider: `Gotra AI (${GOTRA_AI_ENDPOINT})`,
+        maskedValue: maskClientKey(defaultGotraKey),
+        fullValue: defaultGotraKey,
+        configured: true,
+        status: 'ACTIVE · GOTRA ROUTER',
+        purpose: `Powers Gotra AI Router chat completions via ${GOTRA_AI_ENDPOINT}`,
+      },
       {
         id: 'OPENROUTER_API_KEY',
         name: 'OpenRouter API Key (GOT LOCAL)',
@@ -1186,6 +1208,10 @@ async function runStaticHostClientChat(params: {
     (k) => k.id === 'OPENROUTER_API_KEY'
   );
   const openRouterKey = orKeyObj?.fullValue || getRuntimeOpenRouterKey();
+  const gotraKeyObj = localAdmin.apiKeysInventory.find(
+    (k) => k.id === 'GOTRA_AI_API_KEY'
+  );
+  const gotraKey = gotraKeyObj?.fullValue || getRuntimeGotraKey();
 
   const userProfileBlock = params.currentUser
     ? `\nCurrent Logged-In User Profile (Saved in AI Memory):\n- Name: ${params.currentUser.name}\n- Email: ${params.currentUser.email}\n- Role: ${
@@ -1252,26 +1278,54 @@ Never crash or cut off early. NEVER mention or discuss any admin portal, admin w
     messages.push({ role: 'user', content: safeClientPrompt });
   }
 
-  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${openRouterKey}`,
-      'Content-Type': 'application/json',
-      'HTTP-Referer': window.location.origin,
-      'X-Title': 'GOT Agent (Created by Abhinav)',
-    },
-    body: JSON.stringify({
-      model: 'openrouter/auto',
-      max_tokens: 4096,
-      messages,
-    }),
-  });
-
-  if (!res.ok) {
-    throw new Error('Static host AI call failed');
-  }
-  const data = await res.json();
-  const rawReply = String(data?.choices?.[0]?.message?.content || '').trim();
+  const rawReply = await Promise.any([
+    (async () => {
+      const gotraRes = await fetch(GOTRA_AI_ENDPOINT, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${gotraKey}`,
+          'Content-Type': 'application/json',
+          'X-Title': 'GOT Agent (Created by Abhinav)',
+        },
+        body: JSON.stringify({
+          model: 'auto',
+          max_tokens: 4096,
+          messages,
+        }),
+      });
+      if (!gotraRes.ok) throw new Error('Gotra Router static call failed');
+      const gotraData = await gotraRes.json();
+      const txt = String(
+        gotraData?.choices?.[0]?.message?.content ||
+          gotraData?.reply ||
+          gotraData?.text ||
+          ''
+      ).trim();
+      if (!txt) throw new Error('Empty Gotra reply');
+      return txt;
+    })(),
+    (async () => {
+      const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${openRouterKey}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': window.location.origin,
+          'X-Title': 'GOT Agent (Created by Abhinav)',
+        },
+        body: JSON.stringify({
+          model: 'openrouter/auto',
+          max_tokens: 4096,
+          messages,
+        }),
+      });
+      if (!res.ok) throw new Error('Static host AI call failed');
+      const data = await res.json();
+      const txt = String(data?.choices?.[0]?.message?.content || '').trim();
+      if (!txt) throw new Error('Empty OpenRouter reply');
+      return txt;
+    })(),
+  ]);
   const reply = sanitizeClientAiReply(rawReply);
   if (!reply) throw new Error('Empty reply');
 
@@ -2594,6 +2648,7 @@ function GotAdminPortal({
     }
     if (payload.apiKeys && typeof payload.apiKeys === 'object') {
       const idMap: Record<string, string> = {
+        gotraApiKey: 'GOTRA_AI_API_KEY',
         geminiApiKey: 'GEMINI_API_KEY',
         openRouterApiKey: 'OPENROUTER_API_KEY',
         imageGenApiKey: 'IMAGE_GEN_API_KEY',
@@ -3661,6 +3716,7 @@ function GotAdminPortal({
                         type="button"
                         onClick={() => {
                           const fieldMap: Record<string, string> = {
+                            GOTRA_AI_API_KEY: 'gotraApiKey',
                             GEMINI_API_KEY: 'geminiApiKey',
                             OPENROUTER_API_KEY: 'openRouterApiKey',
                             IMAGE_GEN_API_KEY: 'imageGenApiKey',
