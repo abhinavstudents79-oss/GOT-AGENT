@@ -190,8 +190,20 @@ export const OfficialWebsiteSections: React.FC<OfficialWebsiteSectionsProps> = (
             </button>
           </div>
 
-          {/* Instant Access Highlights */}
-          <div className="pt-4 border-t border-stone-200/80 dark:border-stone-800 grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+          {/* Instant Access & Gotra AI Router Highlights */}
+          <div className="pt-4 border-t border-stone-200/80 dark:border-stone-800 grid grid-cols-1 sm:grid-cols-4 gap-3 text-xs">
+            <div className="p-3.5 rounded-2xl liquid-glass-subtle flex items-center justify-between border border-emerald-500/30">
+              <div>
+                <div className="text-stone-500 font-medium">
+                  Gotra AI Router Engine
+                </div>
+                <div className="text-sm font-bold font-mono text-emerald-700 dark:text-emerald-400 mt-0.5">
+                  ⚡ GotraRouter v1 · Connected
+                </div>
+              </div>
+              <Cpu className="w-5 h-5 text-emerald-600" />
+            </div>
+
             <div className="p-3.5 rounded-2xl liquid-glass-subtle flex items-center justify-between">
               <div>
                 <div className="text-stone-500 font-medium">

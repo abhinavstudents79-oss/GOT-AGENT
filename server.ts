@@ -676,6 +676,7 @@ function buildAdminStatePayload() {
     users: adminStore.users || [],
     blockedIps: adminStore.blockedIps || [],
     coAdminAnnouncements: adminStore.coAdminAnnouncements || [],
+    gotraEndpoint: gotraEndpointVal,
     updatedAt: adminStore.updatedAt,
     apiKeysInventory: [
       {
@@ -1437,6 +1438,22 @@ async function generateWithFastModels(
     /\b(detail|comprehensive|complete|full\s+code|step\s+by\s+step|essay|explain\s+everything|long|in\s+depth|all\s+questions|write\s+a\s+program|architecture)\b/i.test(
       userPrompt
     );
+
+  // When GOTRA AI mode is explicitly selected, prioritize Gotra AI Router endpoint first
+  if (agentMode.toUpperCase().includes('GOTRA')) {
+    try {
+      return await callGotraRouterChat(
+        userPrompt,
+        systemInstruction,
+        history,
+        hasImage,
+        imageBase64,
+        imageMimeType
+      );
+    } catch {
+      // Fall through to multi-engine pool if Gotra Router is unreachable
+    }
+  }
 
   // When Google Search is enabled, run Gemini with native { googleSearch: {} } grounding first so real Google Search analysis happens in the background
   if (searchOnFirstPass) {

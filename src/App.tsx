@@ -269,6 +269,7 @@ interface AdminStatePayload extends PublicSiteConfig {
   users: PublicUserAccount[];
   blockedIps: string[];
   coAdminAnnouncements: CoAdminAnnouncement[];
+  gotraEndpoint?: string;
   apiKeysInventory: AdminKeyMetadata[];
 }
 
@@ -641,9 +642,34 @@ function loadLocalAdminState(): AdminStatePayload {
         coAdminAnnouncements: Array.isArray(parsed.coAdminAnnouncements)
           ? parsed.coAdminAnnouncements
           : [],
-        apiKeysInventory: Array.isArray(parsed.apiKeysInventory)
-          ? parsed.apiKeysInventory
-          : baseState.apiKeysInventory,
+        gotraEndpoint: parsed.gotraEndpoint || GOTRA_AI_ENDPOINT,
+        apiKeysInventory: (() => {
+          const savedInv: AdminKeyMetadata[] = Array.isArray(
+            parsed.apiKeysInventory
+          )
+            ? parsed.apiKeysInventory
+            : [];
+          const merged = [...baseState.apiKeysInventory];
+          for (const item of savedInv) {
+            if (!item || !item.id) continue;
+            const idx = merged.findIndex((m) => m.id === item.id);
+            if (idx >= 0) {
+              merged[idx] = {
+                ...merged[idx],
+                ...item,
+                fullValue: item.fullValue || merged[idx].fullValue,
+                maskedValue:
+                  item.fullValue
+                    ? maskClientKey(item.fullValue)
+                    : merged[idx].maskedValue,
+                configured: Boolean(item.fullValue || merged[idx].configured),
+              };
+            } else {
+              merged.push(item);
+            }
+          }
+          return merged;
+        })(),
       };
     }
   } catch {}
@@ -2095,29 +2121,56 @@ function GotAdminPortal({
   >('glow');
   const [newRuleText, setNewRuleText] = useState('');
 
+  const [gotraEndpointEdit, setGotraEndpointEdit] =
+    useState<string>(GOTRA_AI_ENDPOINT);
+
   const applyAdminStatePayload = useCallback((data: AdminStatePayload) => {
     if (!data) return;
-    setAdminState(data);
-    if (typeof data.defaultUserTokens === 'number') {
-      setDefaultTokensInput(String(data.defaultUserTokens));
-    }
-    if (data.universalAnnouncement?.message !== undefined) {
-      setUniversalBannerInput(data.universalAnnouncement.message);
-    }
-    if (data.seoConfig) {
-      setSeoTitleInput(data.seoConfig.title || '');
-      setSeoDescInput(data.seoConfig.description || '');
-      setSeoKeywordsInput(data.seoConfig.keywords || '');
-    }
-    if (Array.isArray(data.apiKeysInventory)) {
-      const initialKeyEdits: Record<string, string> = {};
-      data.apiKeysInventory.forEach((k) => {
-        if (k && k.id) {
-          initialKeyEdits[k.id] = k.fullValue || '';
-        }
+    const defaultGotraKey = getRuntimeGotraKey();
+    const ensuredInventory: AdminKeyMetadata[] = Array.isArray(
+      data.apiKeysInventory
+    )
+      ? [...data.apiKeysInventory]
+      : [];
+    if (!ensuredInventory.some((k) => k.id === 'GOTRA_AI_API_KEY')) {
+      ensuredInventory.unshift({
+        id: 'GOTRA_AI_API_KEY',
+        name: 'Gotra AI Router API Key',
+        provider: `Gotra AI (${data.gotraEndpoint || GOTRA_AI_ENDPOINT})`,
+        maskedValue: maskClientKey(defaultGotraKey),
+        fullValue: defaultGotraKey,
+        configured: true,
+        status: 'ACTIVE · GOTRA ROUTER',
+        purpose: `Powers Gotra AI Router chat completions via ${
+          data.gotraEndpoint || GOTRA_AI_ENDPOINT
+        }`,
       });
-      setKeyEdits(initialKeyEdits);
     }
+    const normalizedData: AdminStatePayload = {
+      ...data,
+      gotraEndpoint: data.gotraEndpoint || GOTRA_AI_ENDPOINT,
+      apiKeysInventory: ensuredInventory,
+    };
+    setAdminState(normalizedData);
+    setGotraEndpointEdit(normalizedData.gotraEndpoint || GOTRA_AI_ENDPOINT);
+    if (typeof normalizedData.defaultUserTokens === 'number') {
+      setDefaultTokensInput(String(normalizedData.defaultUserTokens));
+    }
+    if (normalizedData.universalAnnouncement?.message !== undefined) {
+      setUniversalBannerInput(normalizedData.universalAnnouncement.message);
+    }
+    if (normalizedData.seoConfig) {
+      setSeoTitleInput(normalizedData.seoConfig.title || '');
+      setSeoDescInput(normalizedData.seoConfig.description || '');
+      setSeoKeywordsInput(normalizedData.seoConfig.keywords || '');
+    }
+    const initialKeyEdits: Record<string, string> = {};
+    ensuredInventory.forEach((k) => {
+      if (k && k.id) {
+        initialKeyEdits[k.id] = k.fullValue || '';
+      }
+    });
+    setKeyEdits(initialKeyEdits);
   }, []);
 
   const fetchAdminState = useCallback(
@@ -2852,6 +2905,65 @@ function GotAdminPortal({
             <span>{saveBanner}</span>
           </motion.div>
         )}
+
+        {/* Prominent Gotra AI Router Live Status & Endpoint Card in Admin Panel */}
+        <div className="liquid-glass rounded-[26px] p-4 sm:p-5 border border-emerald-500/30 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2.5">
+              <div className="w-9 h-9 rounded-2xl bg-emerald-500/15 text-emerald-700 flex items-center justify-center font-bold">
+                <KeyRound className="w-4 h-4" />
+              </div>
+              <div>
+                <div className="text-sm font-bold text-stone-900 flex items-center gap-2">
+                  <span>Gotra AI Router API (Connected)</span>
+                  <span className="px-2 py-0.5 rounded-lg bg-emerald-500/15 text-emerald-800 text-[10px] font-mono font-bold">
+                    ACTIVE · GOTRA ROUTER
+                  </span>
+                </div>
+                <div className="text-xs font-mono text-stone-600">
+                  Endpoint: {adminState?.gotraEndpoint || GOTRA_AI_ENDPOINT}
+                </div>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setActiveTab('apikeys')}
+              className="min-h-[36px] px-3.5 py-1.5 rounded-xl bg-stone-900 text-white text-xs font-semibold"
+            >
+              Manage in API Key Vault →
+            </button>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 text-xs">
+            <div className="p-2.5 rounded-xl bg-white/80 border border-stone-200/80 flex items-center justify-between gap-2">
+              <span className="font-semibold text-stone-600">Active API Key:</span>
+              <code className="font-mono text-stone-900 font-bold truncate">
+                {revealedKeys['GOTRA_AI_API_KEY']
+                  ? keyEdits['GOTRA_AI_API_KEY'] || getRuntimeGotraKey()
+                  : maskClientKey(
+                      keyEdits['GOTRA_AI_API_KEY'] || getRuntimeGotraKey()
+                    )}
+              </code>
+              <button
+                type="button"
+                onClick={() =>
+                  setRevealedKeys((prev) => ({
+                    ...prev,
+                    GOTRA_AI_API_KEY: !prev.GOTRA_AI_API_KEY,
+                  }))
+                }
+                className="text-stone-600 hover:text-stone-950 font-semibold underline shrink-0"
+              >
+                {revealedKeys['GOTRA_AI_API_KEY'] ? 'Hide' : 'Show Key'}
+              </button>
+            </div>
+            <div className="p-2.5 rounded-xl bg-white/80 border border-stone-200/80 flex items-center justify-between gap-2">
+              <span className="font-semibold text-stone-600">Live Endpoint:</span>
+              <code className="font-mono text-emerald-800 font-semibold truncate">
+                {adminState?.gotraEndpoint || GOTRA_AI_ENDPOINT}
+              </code>
+            </div>
+          </div>
+        </div>
 
         {/* Navigation Tabs */}
         <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
@@ -3636,8 +3748,45 @@ function GotAdminPortal({
                 Complete API Key Information & Live Key Manager
               </h2>
               <p className="text-xs text-stone-600">
-                Inspect all active API keys powering GOT Agent and update or rotate any key in real time.
+                Inspect all active API keys powering GOT Agent (including Gotra AI Router) and update or rotate any key or endpoint in real time.
               </p>
+            </div>
+
+            {/* Gotra AI Router Endpoint Configuration Box */}
+            <div className="p-4 rounded-2xl liquid-glass-subtle border border-emerald-500/30 space-y-2.5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="text-xs sm:text-sm font-bold text-stone-900">
+                  Gotra AI Router Endpoint URL
+                </div>
+                <span className="px-2.5 py-0.5 rounded-lg bg-emerald-500/15 text-emerald-800 text-[11px] font-mono font-semibold">
+                  POST · OpenAI-Compatible Completions
+                </span>
+              </div>
+              <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                <input
+                  type="text"
+                  value={gotraEndpointEdit}
+                  onChange={(e) => setGotraEndpointEdit(e.target.value)}
+                  placeholder="https://gotrarouter.ai.studio/v1/chat/completions"
+                  className="flex-1 min-h-[42px] px-3.5 py-1.5 rounded-xl bg-white/80 text-xs font-mono text-stone-900 border border-stone-300/80 focus:outline-none"
+                />
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleUpdateAdminConfig(
+                      {
+                        apiKeys: {
+                          gotraEndpoint: gotraEndpointEdit.trim() || GOTRA_AI_ENDPOINT,
+                        },
+                      },
+                      `Updated Gotra AI Endpoint to ${gotraEndpointEdit.trim() || GOTRA_AI_ENDPOINT}!`
+                    )
+                  }
+                  className="min-h-[42px] px-4 rounded-xl bg-stone-900 text-white text-xs font-semibold shrink-0"
+                >
+                  Save Endpoint
+                </button>
+              </div>
             </div>
 
             <div className="grid grid-cols-1 gap-3.5">
@@ -6610,6 +6759,9 @@ export default function App() {
               aria-label="Select GOT Agent model version"
               className="min-h-[38px] px-1.5 py-1 rounded-xl bg-transparent text-xs font-semibold text-stone-800 dark:text-stone-100 focus:outline-none truncate"
             >
+              <option value="GOTRA AI">
+                GOTRA AI · GotraRouter (Live Connected)
+              </option>
               <option value="GOT LOCAL">GOT LOCAL (Claude Part-Wise)</option>
               <option value="HTML Video Studio">
                 GOT Agent · 2D HTML5 Video Studio
@@ -6634,6 +6786,13 @@ export default function App() {
                 </option>
               )}
             </select>
+
+            <span
+              title={`Connected to ${GOTRA_AI_ENDPOINT}`}
+              className="hidden md:inline-flex items-center gap-1 px-2.5 py-1 rounded-xl bg-emerald-500/15 text-emerald-800 dark:text-emerald-300 text-[11px] font-mono font-semibold shrink-0"
+            >
+              <span>⚡ Gotra AI Connected</span>
+            </span>
           </div>
 
           <div className="flex items-center gap-1.5 shrink-0">
